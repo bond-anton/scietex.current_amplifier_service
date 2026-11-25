@@ -3,7 +3,8 @@
 Scietex microservice daemon for current amplifier monitoring and control.
 
 The service drives one or more EBIC v1.0 current-amplifier boards over Modbus
-RTU. Each board is handled by a driver from
+RTU (directly on RS485, or through a Modbus/TCP gateway). Each board is handled
+by a driver from
 [`scietex.hal.current_amplifier`](https://github.com/bond-anton/scietex.hal.current_amplifier),
 selected by entry point name in the service configuration. The service polls
 each board on its own long-lived task, publishes readings to a per-board Valkey
@@ -14,15 +15,17 @@ stream, and exposes control tasks (`amplifier:read`, `amplifier:status`,
 
 | Board | Vendor | MCU | Bus | Driver entry points |
 | --- | --- | --- | --- | --- |
-| EBIC Preamp v1.0 | SCIETEX.RU | STM32F411 | Modbus RTU over RS485 | `ebic_modbus_v1`, `ebic_modbus_v1_preamp` |
+| EBIC Preamp v1.0 | SCIETEX.RU | STM32F411 | Modbus RTU over RS485, or Modbus/TCP through a gateway | `ebic_modbus_v1`, `ebic_modbus_v1_preamp`, `ebic_modbus_tcp_v1`, `ebic_modbus_tcp_v1_preamp` |
 
-`ebic_modbus_v1` is the semantic driver: it maps the relay coils onto feedback
-resistor, boost gain, DC-bias enable and compensation enable, and decodes the
-coil pattern into an `AmplifierState`. `ebic_modbus_v1_preamp` is the raw relay
-driver underneath it: it exposes the coils and the communication settings, but
-its `read_data()` returns an empty snapshot, so a board configured with it
-publishes rows of `None`. Use `ebic_modbus_v1` unless you are driving the
-relays directly.
+The `*_tcp_*` entry points speak the same register/coil surface to a Modbus/TCP
+gateway that routes the requests onto the RS485 bus; the board is selected by
+its Modbus `address` behind the gateway. `ebic_modbus_v1` is the semantic
+driver: it maps the relay coils onto feedback resistor, boost gain, DC-bias
+enable and compensation enable, and decodes the coil pattern into an
+`AmplifierState`. `ebic_modbus_v1_preamp` is the raw relay driver underneath it:
+it exposes the coils and the communication settings, but its `read_data()`
+returns an empty snapshot, so a board configured with it publishes rows of
+`None`. Use `ebic_modbus_v1` unless you are driving the relays directly.
 
 ## Configuration
 
@@ -51,26 +54,72 @@ amplifiers:
     poll_interval: 2.0
     serial:
       port: /dev/ttyUSB1
+  - label: preamp_1
+    driver: ebic_modbus_tcp_v1_preamp
+    transport: tcp
+    address: 3
+    poll_interval: 1.0
+    relay_settle_s: 0.008
+    tcp:
+      host: 127.0.0.1
+      port: 502
+      timeout: 30.0
+      retries: 0
 failure_threshold: 3
 stream_maxlen: 10000
 ```
 
+`transport` defaults to `rs485`, so an entry with only a `serial` block keeps
+working unchanged. Exactly one of `serial` / `tcp` is set, the block must match
+`transport`, and the driver family must match it too (`ebic_modbus_v1*` is
+RS485, `ebic_modbus_tcp_v1*` is TCP). A board's identity is its endpoint plus
+its Modbus address: `(serial.port, address)` on RS485, `(host, port, address)`
+on TCP. Several boards may share one gateway and differ only by `address`.
+
 | Field | Default | Meaning |
 | --- | --- | --- |
 | `label` | required | Unique label; the registry key and the `{label}` segment of the stream key. |
-| `serial.port` | required | Serial device the board is wired to, e.g. `/dev/ttyUSB0`. Each board entry carries its own connection settings. |
+| `transport` | `rs485` | `rs485` or `tcp`; selects which connection block is required. |
+| `serial` | required for `rs485` | RS485 connection block (below). |
+| `tcp` | required for `tcp` | Modbus/TCP gateway block (below). |
+| `serial.port` | required for `rs485` | Serial device the board is wired to, e.g. `/dev/ttyUSB0`. |
 | `baudrate` | `19200` | RS485 baud rate; must be positive. The EBIC firmware default is 19200. |
 | `bytesize` | `8` | Data bits, one of 5–8. |
 | `parity` | `N` | Parity, one of `N`, `E`, `O`. |
 | `stopbits` | `1` | Stop bits, one of `1`, `1.5`, `2`. |
 | `timeout` | `1.0` | Per-operation serial timeout in seconds; must be non-negative. |
 | `framer` | `RTU` | Modbus framing, `RTU` or `ASCII`. |
+| `tcp.host` | required for `tcp` | Gateway host name or address. |
+| `tcp.port` | `502` | Gateway TCP port. |
+| `tcp.timeout` | `30.0` | Per-request client timeout, positive. It must *exceed* the gateway's published `client_timeout_floor`, not merely the device response time, because the gateway holds the RS485 bus through reconnect and retry work before it answers or gives up. 30.0 is sized for `serial.timeout: 1.0`, `bus_retries: 0`, `bus_queue_depth: 4` (floor 26.2 s); a smaller value reports normal bus contention as an unreachable board. |
+| `tcp.retries` | `0` | pymodbus retries per request; non-negative. Zero keeps an ambiguous write from being sent twice. |
 | `driver` | `ebic_modbus_v1` | HAL driver entry point name (see the table above). |
-| `address` | `2` | Modbus slave address, 1–247. Every board on one segment needs a distinct one; the EBIC default is 2. |
+| `address` | `2` | Modbus slave address, 1–247. Every board on one segment — or behind one gateway — needs a distinct one; the EBIC default is 2. |
 | `poll_interval` | `1.0` | Seconds between reads; must be positive. |
 | `relay_settle_s` | driver default (`0.008`) | Optional. Delay after a make write before the dependent relays move. Forwarded only when set and only if the driver accepts the keyword. |
 | `failure_threshold` | `3` | Consecutive failed reads before a board is reported as disconnected. One dropped frame on an RS485 segment must not flip the status. |
 | `stream_maxlen` | `10000` | Entries retained per board's readings stream. |
+
+### Gateway configuration for EBIC boards
+
+Recommended gateway settings: `serial.timeout: 1.0`, `bus_retries: 0`,
+`bus_queue_depth` ≥ number of boards minus one, `allow_unknown_devices: false`,
+`circuit_breaker.failure_threshold: 2`, `cooldown: 30.0`, and one `devices:`
+entry per unit id with `framer: RTU`.
+
+With that layout `client_timeout_floor` is 17.8 s (`q=2`) to 26.2 s (`q=4`), so
+`tcp.timeout: 30.0` is safe. If you raise `serial.timeout`, recompute with
+
+```
+B = t + 0.1 + (r + 1) * t
+s = 2 * t + 0.1
+client_timeout_floor = ((B + s) * (q + 1) + t) + B + s
+```
+
+over `t = serial.timeout`, `r = bus_retries`, `q = bus_queue_depth`. Do not leave
+`tcp.timeout` below the floor, or normal bus contention will be reported as an
+unreachable board. Keep `tcp.retries: 0`: a retry after a timeout re-sends a
+request whose first copy may still be executing.
 
 A configuration change at runtime is **restart-required**: the board registry is
 not live-rebuilt.
@@ -105,8 +154,9 @@ Every write task is gated on the board's declared capabilities, so an
 unsupported command is rejected as `UNSUPPORTED` before the driver is called.
 `amplifier:read`, `amplifier:status` and `amplifier:list` are ungated. Error
 codes are `INVALID_PAYLOAD`, `UNKNOWN_AMPLIFIER`, `UNSUPPORTED`,
-`INVALID_PARAMETERS`, `AMPLIFIER_COMMAND_FAILED` (retryable for bus and relay
-failures), and `MONITORING_FAILED`.
+`INVALID_PARAMETERS`, `AMPLIFIER_COMMAND_FAILED` (retryable for bus and read
+failures), `AMPLIFIER_WRITE_OUTCOME_UNKNOWN` (the write may have reached the
+board, so it must not be replayed), and `MONITORING_FAILED`.
 
 ## Valkey keys
 
@@ -127,7 +177,8 @@ failures), and `MONITORING_FAILED`.
   `devices`, `schema_version` (`1`). `devices` is keyed by board label and
   carries `state` (`error`, `monitoring`, `ok`, `idle`), `driver`, `connected`,
   `monitoring`, `ts`, every `AmplifierState` field, `reading_count`,
-  `error_count`, `last_error`, `last_ok`, and `transconductance_v_per_a`.
+  `error_count`, `last_error`, `last_ok`, `transconductance_v_per_a`, and
+  `transport` (matching `amplifier:list`).
 
 ## Domain notes
 
@@ -152,7 +203,14 @@ failures), and `MONITORING_FAILED`.
 - **One serial bus per port.** Boards that share a port share one RS485
   segment, and every poll is a separate Modbus transaction on that bus, so N
   boards on one segment see readings roughly N × `poll_interval` apart. Give a
-  board its own port when the timing matters.
+  board its own port when the timing matters. The same applies to boards behind
+  one Modbus/TCP gateway: they queue on the gateway's single RS485 bus.
+- **A failing board backs off.** The first failures in a streak retry at
+  `poll_interval`; once the streak reaches `failure_threshold`, every further
+  consecutive failure doubles the delay, capped at 10 × `poll_interval`. A
+  successful read resets the delay to `poll_interval` immediately. A
+  `GatewayBusy` response (bus contended) backs off the same way but does not
+  mark the board disconnected.
 - **Readings are per board, not per channel.** One entry in `amplifiers` is one
   amplifier channel; the stream key and every task address it by `label`.
 
@@ -212,8 +270,9 @@ path is unchanged.
 
 ## Deployment
 
-The board is reached through an RS485 USB adapter, so the adapter node must be
-passed into the container:
+An RS485 board is reached through a USB adapter, so the adapter node must be
+passed into the container (a board on `transport: tcp` needs only network access
+to its gateway):
 
 ```bash
 podman run --rm \
@@ -272,7 +331,8 @@ Every `/dev/ttyUSB*` node a board names in `serial.port` must be passed into the
 container, so a board on an additional adapter needs its own `AddDevice=` line
 in the drop-in; boards that share a port share one RS485 segment. The board's
 `address` must match its Modbus slave address and stay unique on the segment.
-The `ttyUSB` number is assigned in enumeration order and can change across
-reboots or replugs, so pin a udev symlink when the assignment matters. The
-board's line settings must also match its `serial` block (19200 8-N-1 by
-default).
+A board reached through a Modbus/TCP gateway (`transport: tcp`) needs no device
+node, only network access to the gateway's `host:port`. The `ttyUSB` number is
+assigned in enumeration order and can change across reboots or replugs, so pin a
+udev symlink when the assignment matters. The board's line settings must also
+match its `serial` block (19200 8-N-1 by default).

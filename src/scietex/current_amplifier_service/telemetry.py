@@ -6,8 +6,8 @@ single missed beat does not expire the key. The API reads it with its own
 ``CurrentAmplifierServiceTelemetry`` struct: the service fields and the
 ``devices`` map keyed by board label are the wire contract, and unknown fields
 are tolerated by that decoder. The per-board entry therefore also carries the
-producer-only ``reading_count``, ``error_count`` and
-``transconductance_v_per_a`` diagnostics.
+producer-only ``reading_count``, ``error_count``, ``transconductance_v_per_a``
+and ``transport`` extras.
 
 Every measurement is taken from the board's last `AmplifierState` and stays
 ``None`` when the driver has never produced it, matching the HAL's "unknown is
@@ -42,6 +42,7 @@ if TYPE_CHECKING:
     from scietex.hal.current_amplifier.base.protocol import CurrentAmplifierProtocol
 
     from .amplifier_worker import AmplifierStats, CurrentAmplifierWorker
+    from .config import AmplifierSettings
 
 #: Push cadence and key TTL: 2 s interval, 6 s TTL so a single missed beat does
 #: not expire the key.
@@ -56,8 +57,8 @@ class AmplifierTelemetry(msgspec.Struct, frozen=True):
     """One board's decoded state, matching the API read struct field-for-field.
 
     Field order mirrors ``CurrentAmplifierDeviceTelemetry``. ``reading_count``,
-    ``error_count`` and ``transconductance_v_per_a`` are producer-only extras:
-    the API decoder tolerates and ignores them.
+    ``error_count``, ``transconductance_v_per_a`` and ``transport`` are
+    producer-only extras: the API decoder tolerates and ignores them.
 
     Every measurement and setting is ``None`` when the driver could not produce
     it, which is how the HAL distinguishes "unknown" from ``0``/``False``.
@@ -88,6 +89,9 @@ class AmplifierTelemetry(msgspec.Struct, frozen=True):
         reading_count: Successful reads since startup.
         error_count: Failed reads since startup.
         transconductance_v_per_a: ``Rf * gain`` when both are known.
+        transport: ``"rs485"`` for a board on its own serial port, ``"tcp"``
+            for a board behind a Modbus/TCP gateway, matching
+            ``amplifier:list``.
     """
 
     state: str
@@ -115,6 +119,7 @@ class AmplifierTelemetry(msgspec.Struct, frozen=True):
     reading_count: int = 0
     error_count: int = 0
     transconductance_v_per_a: float | None = None
+    transport: str = "rs485"
 
 
 class CurrentAmplifierServiceTelemetry(msgspec.Struct, frozen=True):
@@ -162,7 +167,7 @@ def build_telemetry(worker: CurrentAmplifierWorker) -> CurrentAmplifierServiceTe
         poll_enabled=monitoring,
         timestamp=datetime.now(timezone.utc).isoformat(),
         devices={
-            label: _amplifier_telemetry(worker, label, settings.driver)
+            label: _amplifier_telemetry(worker, label, settings)
             for label, settings in sorted(worker.amplifier_settings.items())
         },
     )
@@ -193,7 +198,7 @@ def _device_state(stats: AmplifierStats, monitoring: bool, connected: bool) -> s
     return "idle"
 
 
-def _amplifier_telemetry(worker: CurrentAmplifierWorker, label: str, driver: str) -> AmplifierTelemetry:
+def _amplifier_telemetry(worker: CurrentAmplifierWorker, label: str, settings: AmplifierSettings) -> AmplifierTelemetry:
     """Build one board's telemetry entry from its stats and last state."""
     stats = worker.stats[label]
     state = stats.last_state
@@ -204,7 +209,7 @@ def _amplifier_telemetry(worker: CurrentAmplifierWorker, label: str, driver: str
     last_ok = stats.last_reading_at.isoformat() if stats.last_reading_at is not None else None
     return AmplifierTelemetry(
         state=_device_state(stats, monitoring, connected),
-        driver=driver,
+        driver=settings.driver,
         connected=connected,
         monitoring=monitoring,
         ts=last_ok,
@@ -228,6 +233,7 @@ def _amplifier_telemetry(worker: CurrentAmplifierWorker, label: str, driver: str
         reading_count=stats.reading_count,
         error_count=stats.error_count,
         transconductance_v_per_a=_transconductance(worker.amplifiers.get(label), state),
+        transport=settings.transport,
     )
 
 

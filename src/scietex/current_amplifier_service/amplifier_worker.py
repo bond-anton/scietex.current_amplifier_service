@@ -2,8 +2,9 @@
 current amplifier boards.
 
 `CurrentAmplifierWorker` extends `ValkeyWorker` and drives one or more EBIC
-v1.0 current-amplifier boards, each over its own RS485 segment. A board is
-driven by a `scietex.hal.current_amplifier` class selected by entry point name;
+v1.0 current-amplifier boards, each over its own RS485 segment or through a
+Modbus/TCP gateway. A board is driven by a
+`scietex.hal.current_amplifier` class selected by entry point name;
 the worker seeds its in-memory board registry from the service-owned
 ``current_amplifier.yml`` at startup and reconciles it against the framework's
 merged remote-config section (the L3 ``current_amplifier`` section replaces the
@@ -13,12 +14,12 @@ state, and one long-lived poll task per board publishes readings to a per-board
 Valkey stream.
 
 Unlike `scietex.vfd_service.vfd_worker`, this worker has no persistent transport
-to open: the EBIC driver connects the serial port once per operation, so
-``connect()`` is a documented no-op. There is therefore no transport-open flag,
-no connect stage, and no reconnect branch in the poll loop — a failed read is
-only a failed read, and ``_connected`` means "the recent reads succeeded".
-Protocol failures are also ``OSError`` subclasses in this HAL, so inferring a
-dead bus from the exception type would be wrong.
+to open: the EBIC driver connects the serial port or the TCP gateway once per
+operation, so ``connect()`` is a documented no-op. There is therefore no
+transport-open flag, no connect stage, and no reconnect branch in the poll loop
+— a failed read is only a failed read, and ``_connected`` means "the recent
+reads succeeded". Protocol failures are also ``OSError`` subclasses in this HAL,
+so inferring a dead bus from the exception type would be wrong.
 """
 
 from __future__ import annotations
@@ -36,6 +37,7 @@ from glide import TimeoutError as GlideTimeoutError
 from scietex.hal.current_amplifier.base.data import AmplifierState
 from scietex.hal.current_amplifier.base.protocol import CurrentAmplifierProtocol
 from scietex.hal.current_amplifier.registry import ENTRY_POINT_GROUP, resolve_driver
+from scietex.hal.current_amplifier.scietex.ebic.modbus.v1 import GatewayBusy
 from scietex.hal.serial import ModbusSerialConnectionConfig
 from scietex.service import Manager, ValkeyWorker, ValkeyWorkerConfig
 from scietex.service.valkey._glide import StreamAddOptions, TrimByMaxLen
@@ -46,6 +48,7 @@ from .config import (
     AmplifierSettings,
     CurrentAmplifierServiceSettings,
     read_current_amplifier_config,
+    transport_for_driver,
 )
 from .task_handlers import AmplifierControlHandler, MonitoringHandler
 from .telemetry import TELEMETRY_INTERVAL, TELEMETRY_TTL, build_telemetry
@@ -63,6 +66,14 @@ STREAM_MAXLEN: int = 10000
 #: ``CurrentAmplifierServiceSettings.failure_threshold``.
 CONNECTED_FAILURE_THRESHOLD: int = 3
 
+#: Cap on the poll backoff, as a multiple of ``poll_interval``. A board that
+#: keeps failing must stop consuming poll slots without being abandoned.
+MAX_BACKOFF_FACTOR: float = 10.0
+
+#: Largest exponent used when doubling the poll delay. ``2**8`` already exceeds
+#: ``MAX_BACKOFF_FACTOR``, so a long outage stays clamped instead of overflowing.
+_MAX_BACKOFF_EXPONENT: int = 8
+
 
 class AmplifierStats(msgspec.Struct):
     """Per-board counters accumulated by the poll loop.
@@ -77,7 +88,8 @@ class AmplifierStats(msgspec.Struct):
     last_error: str | None = None
     # Consecutive failed reads since the last success. A single bus glitch must
     # not flip the board to disconnected, so the poll loop only clears
-    # `_connected` once this reaches the configured failure threshold.
+    # `_connected` once this reaches the configured failure threshold; past that
+    # threshold the streak also drives the poll backoff.
     consecutive_failures: int = 0
 
 
@@ -279,15 +291,16 @@ class CurrentAmplifierWorker(ValkeyWorker):
 
         Idempotent: existing poll tasks are cancelled and existing boards closed
         before the registry is rebuilt. A board is instantiated but not
-        connected here — the driver opens its port per read operation, so an
-        offline board does not block startup.
+        connected here — the driver opens its connection per read operation, so
+        an offline board does not block startup.
 
         Args:
             settings: The authoritative settings to build from.
 
         Raises:
-            ValueError: On a duplicate label, invalid serial settings, an
-                unresolvable driver, or an instance that does not satisfy
+            ValueError: On a duplicate label, a driver whose family contradicts
+                the board's transport, invalid serial settings, an unresolvable
+                driver, or an instance that does not satisfy
                 `CurrentAmplifierProtocol`.
         """
         await self.close_amplifiers()
@@ -310,15 +323,12 @@ class CurrentAmplifierWorker(ValkeyWorker):
             seen.add(label)
 
             driver = resolve_driver(board_settings.driver)
-            # The protocol declares no constructor, so cast to `Any` before the
-            # dynamic instantiation — the concrete driver's `__init__` signature
-            # is unknown statically and validated by the isinstance check below.
-            kwargs: dict[str, Any] = {
-                "con_params": self._connection_config(board_settings),
-                "address": board_settings.address,
-                "label": label,
-                "logger": self.logger,
-            }
+            # The transport decides the constructor shape: the serial driver takes
+            # a connection config, the TCP driver takes the gateway endpoint. The
+            # driver family is re-checked against the transport here, before any
+            # instance is created, so a settings object built outside the
+            # validated config path cannot put a TCP driver on a serial board.
+            kwargs = self._driver_kwargs(board_settings)
             # Only pass the settle delay when configured and when the driver
             # takes it: a driver that declares no such parameter would raise
             # TypeError on construction.
@@ -348,6 +358,43 @@ class CurrentAmplifierWorker(ValkeyWorker):
             self._connected[label] = False
             self._stats[label] = AmplifierStats()
 
+    def _driver_kwargs(self, board_settings: AmplifierSettings) -> dict[str, Any]:
+        """Build one board's driver constructor keyword arguments.
+
+        The transport decides the shape: an RS485 board passes its serial
+        connection config as ``con_params``, a TCP board passes the gateway
+        ``host``/``port`` plus ``timeout``/``retries``. The driver family is
+        checked against the transport first, so a mismatch fails before any
+        driver is instantiated.
+
+        Raises:
+            ValueError: If the driver family contradicts the transport, or if the
+                connection block for that transport is missing.
+        """
+        driver_transport = transport_for_driver(board_settings.driver)
+        if driver_transport is not None and driver_transport != board_settings.transport:
+            raise ValueError(
+                f"amplifier {board_settings.label!r}: driver {board_settings.driver!r} is a "
+                f"{driver_transport} driver but transport is {board_settings.transport!r}"
+            )
+        if board_settings.transport == "tcp":
+            tcp = board_settings.tcp_block()
+            return {
+                "host": tcp.host,
+                "port": tcp.port,
+                "address": board_settings.address,
+                "label": board_settings.label,
+                "timeout": tcp.timeout,
+                "retries": tcp.retries,
+                "logger": self.logger,
+            }
+        return {
+            "con_params": self._connection_config(board_settings),
+            "address": board_settings.address,
+            "label": board_settings.label,
+            "logger": self.logger,
+        }
+
     def _connection_config(self, board_settings: AmplifierSettings) -> ModbusSerialConnectionConfig:
         """Build the serial connection config for one board.
 
@@ -359,7 +406,7 @@ class CurrentAmplifierWorker(ValkeyWorker):
         and rejects an integral float as the wrong type, so an integral value is
         narrowed back to `int` first.
         """
-        serial = board_settings.serial
+        serial = board_settings.serial_block()
         stopbits = int(serial.stopbits) if float(serial.stopbits).is_integer() else serial.stopbits
         try:
             return ModbusSerialConnectionConfig(
@@ -460,17 +507,43 @@ class CurrentAmplifierWorker(ValkeyWorker):
         """Sleep for ``delay``; a separate method so tests can short-circuit the poll loop."""
         await asyncio.sleep(delay)
 
+    def _poll_delay(self, amplifier_settings: AmplifierSettings, stats: AmplifierStats) -> float:
+        """Delay before the next poll: the base interval, or an exponential backoff.
+
+        The first failures in a streak retry at ``poll_interval``. The failure
+        that reaches the connected threshold — the same one that clears
+        ``_connected`` — and every further consecutive failure doubles the
+        delay (2x, 4x, 8x, ...), capped at ``MAX_BACKOFF_FACTOR`` x
+        ``poll_interval``, so a board that keeps losing the bus stops consuming
+        poll slots. A successful read zeroes the streak, so the next delay is
+        the base interval again.
+        """
+        base = amplifier_settings.poll_interval
+        excess = stats.consecutive_failures - self._failure_threshold() + 1
+        if excess <= 0:
+            return base
+        # Clamp the exponent: 2**excess overflows a float once a board has been
+        # down for long enough, and anything past the cap is clamped anyway.
+        return min(base * 2.0 ** min(excess, _MAX_BACKOFF_EXPONENT), base * MAX_BACKOFF_FACTOR)
+
     async def _poll_amplifier(self, label: str) -> None:
         """Poll one board forever: read, publish, repeat.
 
         The loop never dies on a board error: a read failure increments the
-        board's error counters, logs at WARNING, and continues after the poll
-        interval. A successful reading updates the stats and publishes a stream
-        entry. The task is expected to be stopped by cancellation
+        board's error counters, logs at WARNING, and continues after a delay
+        that backs off exponentially once the failure streak is established (see
+        ``_poll_delay``). A successful reading updates the stats, resets the
+        streak and publishes a stream entry.
+
+        A `GatewayBusy` read failure is a contended bus, not a dead board: it
+        backs off like any other failure but does not clear ``_connected``, so a
+        healthy board behind a busy gateway is not reported as disconnected.
+
+        The task is expected to be stopped by cancellation
         (``stop_monitoring``/``cleanup``), not by returning.
 
-        There is no connect stage: the EBIC driver opens its serial port once
-        per operation, so the loop reads directly.
+        There is no connect stage: the EBIC driver opens its connection once per
+        operation, so the loop reads directly.
         """
         amplifier = self._amplifiers.get(label)
         amplifier_settings = self._amplifier_settings.get(label)
@@ -486,10 +559,10 @@ class CurrentAmplifierWorker(ValkeyWorker):
                 # after the configured number of failures in a row.
                 stats = self._stats[label]
                 stats.consecutive_failures += 1
-                if stats.consecutive_failures >= self._failure_threshold():
+                if stats.consecutive_failures >= self._failure_threshold() and not isinstance(exc, GatewayBusy):
                     self._connected[label] = False
                 self._record_error(label, exc, "read")
-                await self._sleep(amplifier_settings.poll_interval)
+                await self._sleep(self._poll_delay(amplifier_settings, stats))
                 continue
 
             self._connected[label] = True

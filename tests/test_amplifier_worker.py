@@ -12,15 +12,18 @@ import msgspec
 import pytest
 from _helpers import (
     _FakeAmplifier,
+    _FakeTcpAmplifier,
     make_amplifier_settings,
     make_settings,
+    make_tcp_amplifier_settings,
     register_fake_driver,
 )
 from scietex.hal.current_amplifier.base.capabilities import FilterType
 from scietex.hal.current_amplifier.base.data import AmplifierState, FilterSetting
+from scietex.hal.current_amplifier.scietex.ebic.modbus.v1 import GatewayBusy
 from scietex.service import ValkeyWorker, ValkeyWorkerConfig
 
-from scietex.current_amplifier_service.amplifier_worker import CurrentAmplifierWorker
+from scietex.current_amplifier_service.amplifier_worker import AmplifierStats, CurrentAmplifierWorker
 from scietex.current_amplifier_service.config import (
     CURRENT_AMPLIFIER_CONFIG_FILE,
     CURRENT_AMPLIFIER_CONFIG_SUBDIR,
@@ -170,10 +173,70 @@ async def test_relay_settle_forwarded_only_when_configured_and_supported(tmp_pat
 async def test_build_amplifiers_rejects_duplicate_labels(tmp_path) -> None:
     """Labels are the registry key, so a duplicate is a hard configuration error."""
     worker = _make_worker(tmp_path)
-    settings = make_settings([make_amplifier_settings("dup"), make_amplifier_settings("dup")])
+    # Distinct endpoints: the label clash is what this test is about.
+    settings = make_settings([make_amplifier_settings("dup"), make_amplifier_settings("dup", port="/dev/ttyUSB1")])
 
     with pytest.raises(ValueError, match="Duplicate amplifier label 'dup'"):
         await worker._build_amplifiers(settings)
+
+
+@pytest.mark.asyncio
+async def test_build_amplifiers_forwards_tcp_endpoint(tmp_path) -> None:
+    """A TCP board is built with the gateway endpoint, not a serial config."""
+    worker = _make_worker(tmp_path)
+    settings = make_settings(
+        [
+            make_tcp_amplifier_settings(
+                "preamp_1",
+                host="gateway.local",
+                port=1502,
+                address=9,
+                timeout=8.5,
+                retries=2,
+                relay_settle_s=0.02,
+            ),
+            make_amplifier_settings("board_b", port="/dev/ttyUSB1", address=4),
+        ]
+    )
+
+    await worker._build_amplifiers(settings)
+
+    tcp = worker.amplifiers["preamp_1"]
+    assert isinstance(tcp, _FakeTcpAmplifier)
+    assert tcp.host == "gateway.local"
+    assert tcp.port == 1502
+    assert tcp.address == 9
+    assert tcp.timeout == 8.5
+    assert tcp.retries == 2
+    assert tcp.label == "preamp_1"
+    assert tcp.logger is worker.logger
+    assert tcp.con_params is None
+    assert tcp.relay_settle_s == pytest.approx(0.02)
+
+    serial = worker.amplifiers["board_b"]
+    assert isinstance(serial, _FakeAmplifier)
+    assert not isinstance(serial, _FakeTcpAmplifier)
+    assert serial.con_params.port == "/dev/ttyUSB1"
+
+    await worker.close_amplifiers()
+
+
+@pytest.mark.asyncio
+async def test_build_amplifiers_rejects_a_driver_that_contradicts_the_transport(tmp_path) -> None:
+    """The build path re-checks the driver family before instantiating anything.
+
+    The config model rejects a mismatch, so this covers a settings object built
+    outside that validated path — ``_build_amplifiers`` is a public hook and
+    must not hand a serial driver TCP keywords.
+    """
+    worker = _make_worker(tmp_path)
+    settings = make_settings([make_amplifier_settings("bad")])
+    object.__setattr__(settings.amplifiers[0], "transport", "tcp")
+
+    with pytest.raises(ValueError, match="is a rs485 driver but transport is 'tcp'"):
+        await worker._build_amplifiers(settings)
+
+    assert worker.amplifiers == {}
 
 
 @pytest.mark.asyncio
@@ -208,7 +271,10 @@ async def test_initialize_reports_bad_serial_as_startup_error_naming_the_label(t
 @pytest.mark.asyncio
 async def test_initialize_reports_duplicate_label_as_startup_error(tmp_path, caplog) -> None:
     """A duplicate label fails startup and is named in the log."""
-    _write_config(tmp_path, make_settings([make_amplifier_settings("dup"), make_amplifier_settings("dup")]))
+    _write_config(
+        tmp_path,
+        make_settings([make_amplifier_settings("dup"), make_amplifier_settings("dup", port="/dev/ttyUSB1")]),
+    )
     worker = _make_worker(tmp_path)
 
     with caplog.at_level(logging.ERROR):
@@ -258,7 +324,7 @@ async def test_rebuild_closes_previous_drivers_once(tmp_path) -> None:
 async def test_registry_maps_every_configured_label(tmp_path) -> None:
     """The public maps share the configured labels and start zeroed."""
     worker = _make_worker(tmp_path)
-    settings = make_settings([make_amplifier_settings("a"), make_amplifier_settings("b")])
+    settings = make_settings([make_amplifier_settings("a"), make_amplifier_settings("b", port="/dev/ttyUSB1")])
 
     await worker._build_amplifiers(settings)
 
@@ -377,7 +443,7 @@ async def test_failure_of_one_board_does_not_stop_another(tmp_path, monkeypatch)
         make_settings(
             [
                 make_amplifier_settings("a", poll_interval=0.001),
-                make_amplifier_settings("b", poll_interval=0.001),
+                make_tcp_amplifier_settings("b", address=4, poll_interval=0.001),
             ],
             failure_threshold=2,
         )
@@ -461,10 +527,87 @@ async def test_poll_loop_recovers_after_failed_reads(tmp_path, monkeypatch) -> N
 
 
 @pytest.mark.asyncio
+async def test_failed_polls_back_off_exponentially_and_reset_on_success(tmp_path, monkeypatch) -> None:
+    """A failing board backs off to 10x the interval; one success returns to base."""
+    worker = _make_worker(tmp_path)
+    interval = 0.01
+    await worker._build_amplifiers(make_settings([make_amplifier_settings("a", poll_interval=interval)], failure_threshold=1))
+    amplifier = worker.amplifiers["a"]
+    amplifier.read_exc = RuntimeError("bus down")
+
+    delays: list[float] = []
+
+    async def record(delay: float) -> None:
+        delays.append(delay)
+        if len(delays) == 4:
+            # The board answers again; the next poll must not wait for the backoff.
+            amplifier.read_exc = None
+        if len(delays) >= 6:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(worker, "_sleep", record)
+
+    with pytest.raises(asyncio.CancelledError):
+        await worker._poll_amplifier("a")
+
+    assert delays == [
+        pytest.approx(2 * interval),
+        pytest.approx(4 * interval),
+        pytest.approx(8 * interval),
+        pytest.approx(10 * interval),
+        pytest.approx(interval),
+        pytest.approx(interval),
+    ]
+    assert worker.stats["a"].consecutive_failures == 0
+    assert worker.connected["a"] is True
+    await worker.close_amplifiers()
+
+
+def test_poll_delay_stays_capped_for_a_long_outage(tmp_path) -> None:
+    """A board down for thousands of polls stays at the cap instead of overflowing."""
+    worker = _make_worker(tmp_path)
+    stats = AmplifierStats(consecutive_failures=5000)
+
+    delay = worker._poll_delay(make_amplifier_settings("a", poll_interval=1.0), stats)
+
+    assert delay == pytest.approx(10.0)
+
+
+@pytest.mark.asyncio
+async def test_gateway_busy_backs_off_without_marking_the_board_disconnected(tmp_path, monkeypatch) -> None:
+    """A contended gateway is retried with backoff but the board stays connected."""
+    worker = _make_worker(tmp_path)
+    interval = 0.01
+    await worker._build_amplifiers(make_settings([make_amplifier_settings("a", poll_interval=interval)], failure_threshold=1))
+    worker.amplifiers["a"].read_exc = GatewayBusy("busy")
+    worker._connected["a"] = True
+
+    delays: list[float] = []
+
+    async def record(delay: float) -> None:
+        delays.append(delay)
+        if len(delays) >= 3:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(worker, "_sleep", record)
+
+    with pytest.raises(asyncio.CancelledError):
+        await worker._poll_amplifier("a")
+
+    assert worker.stats["a"].consecutive_failures == 3
+    assert worker.stats["a"].error_count == 3
+    assert worker.connected["a"] is True
+    assert delays == [pytest.approx(2 * interval), pytest.approx(4 * interval), pytest.approx(8 * interval)]
+    await worker.close_amplifiers()
+
+
+@pytest.mark.asyncio
 async def test_start_and_stop_monitoring(tmp_path) -> None:
     """Monitoring selection is per label, idempotent, and rejects unknown labels."""
     worker = _make_worker(tmp_path)
-    await worker._build_amplifiers(make_settings([make_amplifier_settings("a"), make_amplifier_settings("b")]))
+    await worker._build_amplifiers(
+        make_settings([make_amplifier_settings("a"), make_amplifier_settings("b", port="/dev/ttyUSB1")])
+    )
 
     assert worker.start_monitoring("a") == ["a"]
     task_a = worker._poll_tasks["a"]
@@ -517,7 +660,9 @@ def test_restart_required_after_post_startup_apply(tmp_path) -> None:
 async def test_cleanup_cancels_poll_tasks_and_closes_drivers(tmp_path) -> None:
     """The shutdown path cancels every poll task and closes each driver once."""
     worker = _make_worker(tmp_path)
-    await worker._build_amplifiers(make_settings([make_amplifier_settings("a"), make_amplifier_settings("b")]))
+    await worker._build_amplifiers(
+        make_settings([make_amplifier_settings("a"), make_amplifier_settings("b", port="/dev/ttyUSB1")])
+    )
     amplifier_a = worker.amplifiers["a"]
     amplifier_b = worker.amplifiers["b"]
 

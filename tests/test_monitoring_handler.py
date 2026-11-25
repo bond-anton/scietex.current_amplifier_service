@@ -34,7 +34,9 @@ def _make_worker(tmp_path) -> CurrentAmplifierWorker:
 
 async def _build(worker: CurrentAmplifierWorker, labels: list[str]) -> None:
     """Seed the registry with one fake board per label."""
-    await worker._build_amplifiers(make_settings([make_amplifier_settings(label=label) for label in labels]))
+    await worker._build_amplifiers(
+        make_settings([make_amplifier_settings(label=label, port=f"/dev/ttyUSB{index}") for index, label in enumerate(labels)])
+    )
 
 
 def _handler(worker: CurrentAmplifierWorker) -> MonitoringHandler:

@@ -20,11 +20,13 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, ClassVar, cast
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, cast
 
 import msgspec
 from scietex.hal.current_amplifier.base.capabilities import FilterType
 from scietex.hal.current_amplifier.base.data import FilterSetting
+from scietex.hal.current_amplifier.scietex.ebic.modbus.v1 import GatewayBusy
+from scietex.hal.serial import ModbusOperationError
 from scietex.service.task_handler import (
     TaskCapabilities,
     TaskData,
@@ -38,6 +40,7 @@ if TYPE_CHECKING:
     from scietex.hal.current_amplifier.base.protocol import CurrentAmplifierProtocol
 
     from ..amplifier_worker import CurrentAmplifierWorker
+    from ..config import AmplifierSettings
 
 #: Task name that lists the configured boards and their control surface.
 AMPLIFIER_LIST_TASK_NAME = "amplifier:list"
@@ -79,6 +82,17 @@ AMPLIFIER_SET_INVERTED_TASK_NAME = "amplifier:set-inverted"
 #: without enumerating its options. The eight-resistor preamp is enumerated on
 #: every real board, so only the boost stage needs a fallback.
 DEFAULT_BOOST_GAINS: frozenset[float] = frozenset({1.0, 3.0, 10.0, 30.0})
+
+#: Error code for a write that failed after its request may have left the host.
+#:
+#: The framework drops a failed task's payload, so a consumer cannot see
+#: ``AmplifierCommandError.outcome_unknown``; this code is the durable signal to
+#: branch on instead. Replaying such a write could repeat a hardware transition.
+AMPLIFIER_WRITE_OUTCOME_UNKNOWN: str = "AMPLIFIER_WRITE_OUTCOME_UNKNOWN"
+
+#: Bound on the cause/context walk. A longer chain is pathological, and a
+#: hand-built exception may even point at itself, so the walk must terminate.
+_MAX_EXCEPTION_CHAIN: int = 8
 
 
 class AmplifierStatusRequest(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
@@ -167,10 +181,13 @@ class AmplifierInfo(msgspec.Struct, frozen=True):
         label: Unique board label and stream-key segment.
         driver: Entry point name the board was built from.
         address: Modbus slave address.
-        port: Serial port the board is wired to.
+        port: Configured endpoint: the serial device for an RS485 board, or
+            ``host:port`` for a Modbus/TCP board.
         monitoring: Whether a poll task is currently scheduled.
         connected: Whether the most recent reads succeeded.
         controls: What the board accepts.
+        transport: ``"rs485"`` for a board on its own serial port,
+            ``"tcp"`` for a board behind a Modbus/TCP gateway.
     """
 
     label: str
@@ -180,6 +197,7 @@ class AmplifierInfo(msgspec.Struct, frozen=True):
     monitoring: bool
     connected: bool
     controls: AmplifierControlSummary
+    transport: str = "rs485"
 
 
 class AmplifierListResponse(msgspec.Struct, frozen=True):
@@ -253,6 +271,27 @@ class AmplifierCommandResponse(msgspec.Struct, frozen=True):
     applied: dict[str, Any] = msgspec.field(default_factory=dict)
     state: dict[str, Any] | None = None
     readback_error: str | None = None
+
+
+class AmplifierCommandError(msgspec.Struct, frozen=True):
+    """Machine-readable detail carried in a failed command's result payload.
+
+    The framework drops a failed task's payload when it builds the status
+    record, so this payload only reaches a caller that invokes the handler
+    directly. The operator-facing signal is the task's ``error_code``: an
+    ambiguous write reports `AMPLIFIER_WRITE_OUTCOME_UNKNOWN`, which a consumer
+    branches on without parsing the message. ``outcome_unknown`` stays here for
+    direct callers and repeats that verdict.
+
+    Args:
+        label: Board the command targeted.
+        task: Task name that failed.
+        outcome_unknown: Whether the write may have landed despite the failure.
+    """
+
+    label: str
+    task: str
+    outcome_unknown: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -397,24 +436,146 @@ def _invalid_parameters(message: str) -> TaskResult:
     return TaskResult(status="error", error=message, error_code="INVALID_PARAMETERS", retryable=False)
 
 
-def _command_failure(task: str, exc: Exception) -> TaskResult:
+@dataclass(frozen=True, slots=True)
+class _Failure:
+    """A classified command failure and its verdict on board health.
+
+    Args:
+        result: The task result returned to the framework.
+        unhealthy: Whether the failure proves the board unreachable, in which
+            case the handler clears the board's connected flag. A contended bus
+            is the one bus failure that leaves the board healthy.
+    """
+
+    result: TaskResult
+    unhealthy: bool
+
+
+def _command_result(
+    message: str,
+    *,
+    retryable: bool,
+    error_code: str = "AMPLIFIER_COMMAND_FAILED",
+    payload: bytes = b"",
+) -> TaskResult:
+    """Build a failed command result under the shared command error code."""
+    return TaskResult(
+        status="error",
+        error=message,
+        error_code=error_code,
+        retryable=retryable,
+        payload=payload,
+    )
+
+
+def _exception_chain(exc: BaseException) -> tuple[BaseException, ...]:
+    """Return ``exc`` and its cause/context links, nearest first.
+
+    The EBIC semantic layer wraps every relay-write failure in
+    ``RelayTransitionError`` raised ``from exc``, so the Modbus cause is the
+    ``__cause__`` of the exception the handler sees, never its top-level type.
+    The walk is bounded and cycle-safe: a self-referential ``__cause__`` must
+    not hang the handler.
+    """
+    links: list[BaseException] = []
+    current: BaseException | None = exc
+    for _ in range(_MAX_EXCEPTION_CHAIN):
+        if current is None or any(current is link for link in links):
+            break
+        links.append(current)
+        current = current.__cause__ or current.__context__
+    return tuple(links)
+
+
+def _command_failure(task: str, label: str, exc: Exception, *, stage: Literal["read", "write"]) -> _Failure:
     """Classify an exception raised by the driver while executing ``task``.
 
     A ``NotImplementedError`` means the driver stub was reached despite a truthy
-    capability and a ``ValueError`` means the driver rejected the value; both
-    are terminal. Anything else is treated as a transient bus or device failure
-    and reported as retryable, with the exception type kept in the message.
+    capability and a ``ValueError`` means the driver rejected the value; both are
+    raised before any bus traffic, so they are terminal, say nothing about the
+    board's health and leave the write outcome known.
+
+    Bus failures are matched through the exception chain rather than the
+    top-level type, because the EBIC semantic layer catches every ``set_relay``
+    failure and re-raises ``RelayTransitionError`` with the original error as
+    ``__cause__``. A ``GatewayBusy`` (Modbus 0x06) anywhere in the chain is
+    retryable on both stages and leaves the board healthy: 0x06 is an answer
+    that the request was not executed, and ``_transition`` re-reads the coil
+    vector and drives toward the same absolute target, so a re-run cannot apply
+    a second, different transition. The trade-off is that a board stuck busy is
+    never cleared by this path — its ``connected`` flag stays set while the poll
+    counters and telemetry report ``error`` — which is accepted because 0x06
+    itself proves the gateway is answering.
+
+    Every other write failure is terminal: the request may have reached the
+    board even though the response did not come back, and replaying it would
+    risk a duplicate hardware transition. Such a write is reported with
+    `AMPLIFIER_WRITE_OUTCOME_UNKNOWN`, carries ``outcome_unknown`` for direct
+    callers, and clears the board's connected flag.
+
+    Reads keep their previous rows: a bus failure is retryable, a
+    ``ModbusOperationError`` (including ``GatewayTargetFailed``, 0x0B) also
+    marks the board unhealthy, and anything outside the Modbus taxonomy is
+    retryable and says nothing about board health.
     """
     if isinstance(exc, NotImplementedError):
-        return TaskResult(status="error", error=f"Driver does not implement {task}", error_code="UNSUPPORTED", retryable=False)
+        return _Failure(
+            TaskResult(status="error", error=f"Driver does not implement {task}", error_code="UNSUPPORTED", retryable=False),
+            unhealthy=False,
+        )
     if isinstance(exc, ValueError):
-        return TaskResult(status="error", error=str(exc), error_code="INVALID_PARAMETERS", retryable=False)
-    return TaskResult(
-        status="error",
-        error=f"{task} failed: {type(exc).__name__}: {exc}",
-        error_code="AMPLIFIER_COMMAND_FAILED",
-        retryable=True,
-    )
+        return _Failure(
+            TaskResult(status="error", error=str(exc), error_code="INVALID_PARAMETERS", retryable=False),
+            unhealthy=False,
+        )
+
+    chain = _exception_chain(exc)
+    message = f"{task} failed: {type(exc).__name__}: {exc}"
+    if any(isinstance(link, GatewayBusy) for link in chain):
+        return _Failure(_command_result(message, retryable=True), unhealthy=False)
+    if stage == "write":
+        # WHY: the top-level RelayTransitionError (or an exception outside the
+        # Modbus taxonomy) may have been raised after the request left the host.
+        # Only 0x06 proves non-execution, so report the ambiguity rather than
+        # invite a replay.
+        detail = AmplifierCommandError(label=label, task=task, outcome_unknown=True)
+        return _Failure(
+            _command_result(
+                f"{message} (write outcome unknown; do not retry)",
+                retryable=False,
+                error_code=AMPLIFIER_WRITE_OUTCOME_UNKNOWN,
+                payload=msgspec.json.encode(detail),
+            ),
+            unhealthy=True,
+        )
+    if any(isinstance(link, ModbusOperationError) for link in chain):
+        return _Failure(_command_result(message, retryable=True), unhealthy=True)
+    return _Failure(_command_result(message, retryable=True), unhealthy=False)
+
+
+def _host_port(host: str, port: int) -> str:
+    """Render ``host:port``, bracketing an IPv6 literal.
+
+    A literal IPv6 address already contains colons, so an unbracketed
+    ``::1:502`` cannot be split back into host and port. An already-bracketed
+    literal is left as configured.
+    """
+    if ":" in host and not host.startswith("["):
+        return f"[{host}]:{port}"
+    return f"{host}:{port}"
+
+
+def _endpoint(settings: AmplifierSettings) -> str:
+    """Render a board's configured endpoint for the list payload.
+
+    An RS485 board reports its serial device. A TCP board reports the gateway as
+    ``host:port``: that is the connection the board is reached through, while
+    its Modbus address distinguishes boards sharing one gateway.
+    """
+    if settings.transport == "tcp":
+        tcp = settings.tcp_block()
+        return _host_port(tcp.host, tcp.port)
+    return settings.serial_block().port
 
 
 async def _apply_feedback_resistor(amplifier: CurrentAmplifierProtocol, request: AmplifierCommandRequest) -> None:
@@ -648,7 +809,7 @@ class AmplifierControlHandler(TaskHandler):
         try:
             await command.apply(amplifier, request)
         except Exception as exc:
-            return _command_failure(task, exc)
+            return self._fail(label, _command_failure(task, label, exc, stage="write"))
 
         state: AmplifierState | None = None
         readback_error: str | None = None
@@ -693,11 +854,18 @@ class AmplifierControlHandler(TaskHandler):
             label=label,
             driver=settings.driver,
             address=settings.address,
-            port=settings.serial.port,
+            port=_endpoint(settings),
             monitoring=self._worker.monitoring.get(label, False),
             connected=self._worker.connected.get(label, False),
             controls=_control_summary(amplifier),
+            transport=settings.transport,
         )
+
+    def _fail(self, label: str, failure: _Failure) -> TaskResult:
+        """Return a classified failure, marking the board unhealthy when proven."""
+        if failure.unhealthy:
+            self._worker.connected[label] = False
+        return failure.result
 
     def _status(self, task_data: TaskData) -> TaskResult:
         """Report cached status for one board or every board."""
@@ -745,6 +913,6 @@ class AmplifierControlHandler(TaskHandler):
         try:
             state = await amplifier.read_data()
         except Exception as exc:
-            return _command_failure(task, exc)
+            return self._fail(label, _command_failure(task, label, exc, stage="read"))
         response = AmplifierCommandResponse(label=label, task=task, state=_state_dict(state))
         return TaskResult(status="success", payload=msgspec.json.encode(response))

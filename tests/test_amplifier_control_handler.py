@@ -15,6 +15,7 @@ from _helpers import (
     _make_context,
     _make_task,
     make_amplifier_settings,
+    make_tcp_amplifier_settings,
 )
 from scietex.hal.current_amplifier.base.capabilities import (
     Access,
@@ -31,7 +32,9 @@ from scietex.hal.current_amplifier.base.capabilities import (
 from scietex.hal.current_amplifier.base.data import AmplifierState, FilterSetting
 from scietex.hal.current_amplifier.base.errors import UnexpectedResponse
 from scietex.hal.current_amplifier.base.protocol import CurrentAmplifierProtocol
+from scietex.hal.current_amplifier.scietex.ebic.modbus.v1 import GatewayBusy, GatewayTargetFailed
 from scietex.hal.current_amplifier.scietex.ebic.modbus.v1.semantic import RelayTransitionError
+from scietex.hal.serial import ModbusOperationError
 from scietex.service.task_handler import TaskData
 
 from scietex.current_amplifier_service.amplifier_worker import AmplifierStats
@@ -49,6 +52,8 @@ from scietex.current_amplifier_service.task_handlers import (
     AMPLIFIER_SET_INPUT_COMPENSATION_TASK_NAME,
     AMPLIFIER_SET_INVERTED_TASK_NAME,
     AMPLIFIER_STATUS_TASK_NAME,
+    AMPLIFIER_WRITE_OUTCOME_UNKNOWN,
+    AmplifierCommandError,
     AmplifierCommandResponse,
     AmplifierControlHandler,
     AmplifierListResponse,
@@ -173,9 +178,12 @@ class _RecordingAmplifier(CurrentAmplifierProtocol):
     """A protocol fake recording every control call and able to raise on demand.
 
     ``capabilities`` defaults to a fully writeable tree and may be shadowed per
-    instance. ``control_exc`` makes every setter raise after recording the call;
-    ``read_exc`` makes ``read_data`` raise. ``strict`` makes any I/O raise, so a
-    registry-only task proves it never touched the driver.
+    instance. ``control_exc`` makes every setter raise after recording the call,
+    with ``control_cause`` as its ``__cause__`` when supplied — the shape the
+    EBIC driver produces, where a ``RelayTransitionError`` wraps the Modbus
+    failure. ``read_exc`` makes ``read_data`` raise, with ``read_cause`` as its
+    ``__cause__``. ``strict`` makes any I/O raise, so a registry-only task
+    proves it never touched the driver.
     """
 
     capabilities = _full_capabilities()
@@ -186,14 +194,18 @@ class _RecordingAmplifier(CurrentAmplifierProtocol):
         capabilities: CurrentAmplifierCapabilities | None = None,
         state: AmplifierState | None = None,
         control_exc: Exception | None = None,
+        control_cause: BaseException | None = None,
         read_exc: Exception | None = None,
+        read_cause: BaseException | None = None,
         strict: bool = False,
     ) -> None:
         if capabilities is not None:
             self.capabilities = capabilities
         self.state = _make_state() if state is None else state
         self.control_exc = control_exc
+        self.control_cause = control_cause
         self.read_exc = read_exc
+        self.read_cause = read_cause
         self.strict = strict
         self.connect_calls = 0
         self.close_calls = 0
@@ -214,6 +226,8 @@ class _RecordingAmplifier(CurrentAmplifierProtocol):
 
     def _raise_control(self) -> None:
         if self.control_exc is not None:
+            if self.control_cause is not None:
+                raise self.control_exc from self.control_cause
             raise self.control_exc
 
     async def connect(self) -> None:
@@ -228,6 +242,8 @@ class _RecordingAmplifier(CurrentAmplifierProtocol):
         self._forbid_io("read_data")
         self.read_calls += 1
         if self.read_exc is not None:
+            if self.read_cause is not None:
+                raise self.read_exc from self.read_cause
             raise self.read_exc
         return self.state
 
@@ -379,13 +395,48 @@ async def test_list_reports_every_board_without_driver_io() -> None:
     assert by_label["a"].driver == FAKE_DRIVER_NAME
     assert by_label["a"].address == 1
     assert by_label["a"].port == "/dev/ttyUSB0"
+    assert by_label["a"].transport == "rs485"
     assert by_label["b"].address == 2
     assert by_label["b"].port == "/dev/ttyUSB1"
+    assert by_label["b"].transport == "rs485"
     for amplifier in worker.amplifiers.values():
         assert amplifier.read_calls == 0
         assert amplifier.connect_calls == 0
         assert amplifier.close_calls == 0
         assert all(calls == [] for calls in _all_control_calls(amplifier))
+
+
+@pytest.mark.asyncio
+async def test_list_reports_a_tcp_board_as_host_port() -> None:
+    """A board behind a gateway reports ``host:port`` and its transport, not a serial device."""
+    worker = _StubWorker()
+    worker.amplifiers[LABEL] = _RecordingAmplifier(strict=True)
+    worker.amplifier_settings[LABEL] = make_tcp_amplifier_settings(label=LABEL, host="gateway.local", port=1502)
+    worker.monitoring[LABEL] = False
+    worker.connected[LABEL] = False
+    worker.stats[LABEL] = AmplifierStats()
+
+    response = await _list(worker)
+
+    entry = response.amplifiers[0]
+    assert entry.port == "gateway.local:1502"
+    assert entry.transport == "tcp"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("host", "expected"), [("::1", "[::1]:502"), ("[::1]", "[::1]:502")])
+async def test_list_brackets_an_ipv6_gateway_address(host, expected) -> None:
+    """An IPv6 literal keeps its colons inside brackets so host and port stay parseable."""
+    worker = _StubWorker()
+    worker.amplifiers[LABEL] = _RecordingAmplifier(strict=True)
+    worker.amplifier_settings[LABEL] = make_tcp_amplifier_settings(label=LABEL, host=host)
+    worker.monitoring[LABEL] = False
+    worker.connected[LABEL] = False
+    worker.stats[LABEL] = AmplifierStats()
+
+    response = await _list(worker)
+
+    assert response.amplifiers[0].port == expected
 
 
 @pytest.mark.asyncio
@@ -713,6 +764,202 @@ async def test_feedback_resistor_read_back_failure_still_reports_the_write() -> 
     assert amplifier.read_calls == 1
 
 
+@pytest.mark.asyncio
+async def test_gateway_target_failed_read_back_still_reports_the_write() -> None:
+    """A gateway failure on the read-back never turns a landed write into an error.
+
+    ``GatewayTargetFailed`` on a write is ambiguous, but here the write already
+    completed; only the follow-up read failed. The landed-write rule takes
+    precedence, so the result stays ``success`` with ``readback_error``.
+    """
+    amplifier = _RecordingAmplifier(read_exc=GatewayTargetFailed("target unreachable"))
+    worker = _worker_for(amplifier)
+    worker.connected[LABEL] = True
+
+    result = await _handler(worker).handle(
+        _make_task(AMPLIFIER_SET_FEEDBACK_RESISTOR_TASK_NAME, {"label": LABEL, "resistance_ohm": 1_000_000.0}),
+        capabilities=_make_capabilities(),
+    )
+
+    assert result.status == "success"
+    assert result.error_code == ""
+    assert result.retryable is False
+    response = msgspec.json.decode(result.payload, type=AmplifierCommandResponse)
+    assert response.applied == {"resistance_ohm": 1_000_000.0}
+    assert response.state is None
+    assert response.readback_error is not None
+    assert "GatewayTargetFailed" in response.readback_error
+    assert amplifier.select_feedback_resistor_calls == [1_000_000.0]
+    assert amplifier.read_calls == 1
+    assert worker.connected[LABEL] is True
+
+
+@pytest.mark.asyncio
+async def test_relay_transition_read_back_still_reports_the_write() -> None:
+    """A wrapped relay failure on the read-back cannot undo a write that landed.
+
+    The EBIC driver reports a failed relay read-back as a
+    ``RelayTransitionError``; on the write stage that type is ambiguous, but
+    here the write already completed, so it stays diagnostic.
+    """
+    amplifier = _RecordingAmplifier(read_exc=RelayTransitionError("select feedback resistor", None, (True,), (False,)))
+    worker = _worker_for(amplifier)
+    worker.connected[LABEL] = True
+
+    result = await _handler(worker).handle(
+        _make_task(AMPLIFIER_SET_FEEDBACK_RESISTOR_TASK_NAME, {"label": LABEL, "resistance_ohm": 1_000_000.0}),
+        capabilities=_make_capabilities(),
+    )
+
+    assert result.status == "success"
+    assert result.error_code == ""
+    assert result.retryable is False
+    response = msgspec.json.decode(result.payload, type=AmplifierCommandResponse)
+    assert response.applied == {"resistance_ohm": 1_000_000.0}
+    assert response.state is None
+    assert response.readback_error is not None
+    assert "RelayTransitionError" in response.readback_error
+    assert worker.connected[LABEL] is True
+
+
+def test_gateway_failures_are_sibling_modbus_errors() -> None:
+    """``GatewayBusy`` and ``GatewayTargetFailed`` are distinct Modbus failures.
+
+    Both are classified with ``isinstance``, so neither may subclass the other:
+    a busy gateway is retryable, while a gateway that cannot reach its target
+    marks the board unhealthy. Both must stay catchable as
+    ``ModbusOperationError``.
+    """
+    assert issubclass(GatewayBusy, ModbusOperationError)
+    assert issubclass(GatewayTargetFailed, ModbusOperationError)
+    assert not issubclass(GatewayBusy, GatewayTargetFailed)
+    assert not issubclass(GatewayTargetFailed, GatewayBusy)
+
+
+_BUS_FAILURE_CASES = [
+    ("write", GatewayBusy("gateway busy"), True, False),
+    ("read", GatewayBusy("gateway busy"), True, False),
+    ("write", GatewayTargetFailed("target unreachable"), False, True),
+    ("read", GatewayTargetFailed("target unreachable"), True, True),
+    ("write", ModbusOperationError("crc error"), False, True),
+    ("read", ModbusOperationError("crc error"), True, True),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("stage", "exc", "retryable", "unhealthy"), _BUS_FAILURE_CASES)
+async def test_bus_failure_taxonomy(stage, exc, retryable, unhealthy) -> None:
+    """Bus failures map to the documented retry verdict and board-health mark.
+
+    A busy bus never executed the request, so it stays healthy and retryable.
+    Gateway reach and generic Modbus failures prove the board unreachable. A
+    failed write is terminal because the request may already have landed, and
+    is reported as an unknown outcome; a failed read is safe to retry.
+
+    The EBIC driver raises these exceptions directly from ``read_relays``, so a
+    raw instance is the shape a read produces. On a write the driver wraps the
+    cause; `test_wrapped_write_failure_is_classified_by_cause` covers that path.
+    """
+    amplifier = _RecordingAmplifier(control_exc=exc) if stage == "write" else _RecordingAmplifier(read_exc=exc)
+    worker = _worker_for(amplifier)
+    worker.connected[LABEL] = True
+    task, payload = (
+        (AMPLIFIER_SET_DC_BIAS_TASK_NAME, {"label": LABEL, "enabled": True})
+        if stage == "write"
+        else (AMPLIFIER_READ_TASK_NAME, {"label": LABEL})
+    )
+    ambiguous_write = stage == "write" and not retryable
+
+    result = await _handler(worker).handle(_make_task(task, payload), capabilities=_make_capabilities())
+
+    assert result.status == "error"
+    assert result.error_code == (AMPLIFIER_WRITE_OUTCOME_UNKNOWN if ambiguous_write else "AMPLIFIER_COMMAND_FAILED")
+    assert result.retryable is retryable
+    assert worker.connected[LABEL] is (not unhealthy)
+    assert type(exc).__name__ in result.error
+
+    if ambiguous_write:
+        detail = msgspec.json.decode(result.payload, type=AmplifierCommandError)
+        assert detail.label == LABEL
+        assert detail.task == task
+        assert detail.outcome_unknown is True
+    else:
+        assert result.payload == b""
+
+
+_WRAPPED_WRITE_CASES = [
+    (GatewayBusy("gateway busy"), True, False),
+    (GatewayTargetFailed("target unreachable"), False, True),
+    (ModbusOperationError("crc error"), False, True),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("cause", "retryable", "unhealthy"), _WRAPPED_WRITE_CASES)
+async def test_wrapped_write_failure_is_classified_by_cause(cause, retryable, unhealthy) -> None:
+    """A write failure is classified through the driver's wrapper, not by its type.
+
+    The EBIC semantic layer raises ``RelayTransitionError`` from the underlying
+    Modbus failure, so the top-level type alone never proves anything about the
+    bus. A ``GatewayBusy`` cause keeps the write retryable; every other cause is
+    an ambiguous write and must not be replayed.
+    """
+    exc = RelayTransitionError("set dc bias", 3, (True,), None)
+    amplifier = _RecordingAmplifier(control_exc=exc, control_cause=cause)
+    worker = _worker_for(amplifier)
+    worker.connected[LABEL] = True
+
+    result = await _handler(worker).handle(
+        _make_task(AMPLIFIER_SET_DC_BIAS_TASK_NAME, {"label": LABEL, "enabled": True}),
+        capabilities=_make_capabilities(),
+    )
+
+    assert result.status == "error"
+    assert result.retryable is retryable
+    assert worker.connected[LABEL] is (not unhealthy)
+    assert "RelayTransitionError" in result.error
+    if retryable:
+        assert result.error_code == "AMPLIFIER_COMMAND_FAILED"
+        assert result.payload == b""
+    else:
+        assert result.error_code == AMPLIFIER_WRITE_OUTCOME_UNKNOWN
+        detail = msgspec.json.decode(result.payload, type=AmplifierCommandError)
+        assert detail.outcome_unknown is True
+
+
+_READ_WRAPPED_CASES = [
+    (GatewayBusy("gateway busy"), False),
+    (GatewayTargetFailed("target unreachable"), True),
+    (ModbusOperationError("crc error"), True),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("cause", "unhealthy"), _READ_WRAPPED_CASES)
+async def test_read_wrapped_failure_keeps_the_read_verdict(cause, unhealthy) -> None:
+    """A wrapped read failure keeps the read rows: retryable, health from the cause.
+
+    Reads are never ambiguous, so the chain walk changes only the board-health
+    verdict: a busy gateway still proves the board is answering, while a reach
+    or bus failure marks it unhealthy.
+    """
+    exc = RelayTransitionError("read relays", None, (True,), (False,))
+    amplifier = _RecordingAmplifier(read_exc=exc, read_cause=cause)
+    worker = _worker_for(amplifier)
+    worker.connected[LABEL] = True
+
+    result = await _handler(worker).handle(
+        _make_task(AMPLIFIER_READ_TASK_NAME, {"label": LABEL}),
+        capabilities=_make_capabilities(),
+    )
+
+    assert result.status == "error"
+    assert result.error_code == "AMPLIFIER_COMMAND_FAILED"
+    assert result.retryable is True
+    assert result.payload == b""
+    assert worker.connected[LABEL] is (not unhealthy)
+
+
 _GATE_CASES = [
     (
         AMPLIFIER_SET_FEEDBACK_RESISTOR_TASK_NAME,
@@ -1004,22 +1251,31 @@ async def test_missing_required_write_field_is_invalid_parameters(task, field) -
     assert all(calls == [] for calls in _all_control_calls(amplifier))
 
 
-_EXCEPTION_CASES = [
-    (NotImplementedError("stub"), "UNSUPPORTED", False),
-    (ValueError("out of range"), "INVALID_PARAMETERS", False),
-    (OSError("bus down"), "AMPLIFIER_COMMAND_FAILED", True),
-    (UnexpectedResponse("gain", "bad frame"), "AMPLIFIER_COMMAND_FAILED", True),
-    (RelayTransitionError("set dc bias", 3, (True, False), None), "AMPLIFIER_COMMAND_FAILED", True),
-    (RuntimeError("unexpected"), "AMPLIFIER_COMMAND_FAILED", True),
+_WRITE_EXCEPTION_CASES = [
+    # Raised before any bus traffic: the write outcome is known.
+    (NotImplementedError("stub"), "UNSUPPORTED", False, False),
+    (ValueError("out of range"), "INVALID_PARAMETERS", False, False),
+    # Raised during or after the write: the request may have reached the board.
+    (OSError("bus down"), AMPLIFIER_WRITE_OUTCOME_UNKNOWN, False, True),
+    (UnexpectedResponse("gain", "bad frame"), AMPLIFIER_WRITE_OUTCOME_UNKNOWN, False, True),
+    (RelayTransitionError("set dc bias", 3, (True, False), None), AMPLIFIER_WRITE_OUTCOME_UNKNOWN, False, True),
+    (RuntimeError("unexpected"), AMPLIFIER_WRITE_OUTCOME_UNKNOWN, False, True),
 ]
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("exc", "error_code", "retryable"), _EXCEPTION_CASES)
-async def test_driver_exception_mapping(exc, error_code, retryable) -> None:
-    """Driver exceptions are classified by type into the task error taxonomy."""
+@pytest.mark.parametrize(("exc", "error_code", "retryable", "unhealthy"), _WRITE_EXCEPTION_CASES)
+async def test_write_exception_mapping(exc, error_code, retryable, unhealthy) -> None:
+    """A write exception is terminal unless it proves the request was not executed.
+
+    A ``NotImplementedError`` and a ``ValueError`` are raised before any bus
+    traffic. Every other write failure — including one outside the Modbus
+    taxonomy — may have landed, so it is non-retryable, reports an unknown
+    outcome and clears the board's connected flag.
+    """
     amplifier = _RecordingAmplifier(control_exc=exc)
     worker = _worker_for(amplifier)
+    worker.connected[LABEL] = True
 
     result = await _handler(worker).handle(
         _make_task(AMPLIFIER_SET_DC_BIAS_TASK_NAME, {"label": LABEL, "enabled": True}),
@@ -1029,6 +1285,11 @@ async def test_driver_exception_mapping(exc, error_code, retryable) -> None:
     assert result.status == "error"
     assert result.error_code == error_code
     assert result.retryable is retryable
+    assert worker.connected[LABEL] is (not unhealthy)
     assert amplifier.set_dc_bias_calls == [True]
-    if error_code == "AMPLIFIER_COMMAND_FAILED":
-        assert type(exc).__name__ in result.error
+    if error_code == AMPLIFIER_WRITE_OUTCOME_UNKNOWN:
+        detail = msgspec.json.decode(result.payload, type=AmplifierCommandError)
+        assert detail.outcome_unknown is True
+        assert "(write outcome unknown; do not retry)" in result.error
+    else:
+        assert result.payload == b""

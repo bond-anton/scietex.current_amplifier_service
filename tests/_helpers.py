@@ -27,12 +27,17 @@ from scietex.service.task_handler import TaskCapabilities, TaskData, TaskHandler
 from scietex.current_amplifier_service.config import (
     AmplifierSerialSettings,
     AmplifierSettings,
+    AmplifierTcpSettings,
     CurrentAmplifierServiceSettings,
 )
 
 #: Entry point name the fake driver is advertised under by default, so a board
 #: configured with the default driver resolves to `_FakeAmplifier`.
 FAKE_DRIVER_NAME = "ebic_modbus_v1"
+
+#: Entry point name of the fake Modbus/TCP driver, so a TCP board resolves to
+#: `_FakeTcpAmplifier` through the same registry path as the serial fake.
+FAKE_TCP_DRIVER_NAME = "ebic_modbus_tcp_v1"
 
 #: The capability tree of the EBIC v1.0 board: the four implemented writes
 #: (feedback resistor, boost gain, DC bias, input compensation), no filters, no
@@ -92,7 +97,12 @@ def register_fake_driver(
     name: str = FAKE_DRIVER_NAME,
     factory: object | None = None,
 ) -> None:
-    """Advertise a fake driver as the only entry point in the HAL registry.
+    """Advertise the fake drivers as the entry points in the HAL registry.
+
+    With no ``factory`` both transports are servable: ``ebic_modbus_v1``
+    resolves to `_FakeAmplifier` and ``ebic_modbus_tcp_v1`` to
+    `_FakeTcpAmplifier`. Passing ``factory`` advertises that single class under
+    ``name`` instead, for tests that need one specific constructor.
 
     The worker resolves drivers from installed distribution metadata, which a
     test module cannot contribute to. Patching the registry's ``entry_points``
@@ -102,11 +112,16 @@ def register_fake_driver(
     """
     from scietex.hal.current_amplifier import registry
 
-    driver = _FakeAmplifier if factory is None else factory
-    entry_point = _FakeEntryPoint(name=name, factory=driver)
+    if factory is None:
+        entries = [
+            _FakeEntryPoint(name=FAKE_DRIVER_NAME, factory=_FakeAmplifier),
+            _FakeEntryPoint(name=FAKE_TCP_DRIVER_NAME, factory=_FakeTcpAmplifier),
+        ]
+    else:
+        entries = [_FakeEntryPoint(name=name, factory=factory)]
 
     def fake_entry_points(**_: object) -> list[_FakeEntryPoint]:
-        return [entry_point]
+        return entries
 
     monkeypatch.setattr(registry, "entry_points", fake_entry_points)
 
@@ -223,6 +238,40 @@ class _FakeAmplifier(CurrentAmplifierProtocol):
         self.input_compensation_enabled = enabled
 
 
+class _FakeTcpAmplifier(_FakeAmplifier):
+    """A `CurrentAmplifierProtocol` fake for a board behind a Modbus/TCP gateway.
+
+    Mirrors the HAL TCP driver's constructor: the endpoint and the per-request
+    timeout/retry knobs replace the serial connection config, which stays
+    `None`. Behaviour is inherited, so a TCP board polls exactly like a serial
+    one.
+    """
+
+    def __init__(
+        self,
+        host: str,
+        port: int = 502,
+        address: int = 2,
+        label: str = "EBIC",
+        timeout: float = 6.0,
+        retries: int = 0,
+        logger: logging.Logger | None = None,
+        *,
+        relay_settle_s: float = 0.008,
+    ) -> None:
+        super().__init__(
+            con_params=None,
+            address=address,
+            label=label,
+            logger=logger,
+            relay_settle_s=relay_settle_s,
+        )
+        self.host = host
+        self.port = port
+        self.timeout = timeout
+        self.retries = retries
+
+
 def make_amplifier_settings(
     label: str = "photodiode_a",
     *,
@@ -233,10 +282,34 @@ def make_amplifier_settings(
     relay_settle_s: float | None = None,
     serial: AmplifierSerialSettings | None = None,
 ) -> AmplifierSettings:
-    """Build valid board settings; the serial defaults are the EBIC firmware's."""
+    """Build valid RS485 board settings; the serial defaults are the EBIC firmware's."""
     return AmplifierSettings(
         label=label,
         serial=serial if serial is not None else AmplifierSerialSettings(port=port),
+        driver=driver,
+        address=address,
+        poll_interval=poll_interval,
+        relay_settle_s=relay_settle_s,
+    )
+
+
+def make_tcp_amplifier_settings(
+    label: str = "preamp_1",
+    *,
+    host: str = "127.0.0.1",
+    port: int = 502,
+    address: int = 3,
+    timeout: float = 6.0,
+    retries: int = 0,
+    poll_interval: float = 1.0,
+    relay_settle_s: float | None = None,
+    driver: str = FAKE_TCP_DRIVER_NAME,
+) -> AmplifierSettings:
+    """Build valid Modbus/TCP board settings pointing at a gateway endpoint."""
+    return AmplifierSettings(
+        label=label,
+        tcp=AmplifierTcpSettings(host=host, port=port, timeout=timeout, retries=retries),
+        transport="tcp",
         driver=driver,
         address=address,
         poll_interval=poll_interval,

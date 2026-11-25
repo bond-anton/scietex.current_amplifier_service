@@ -6,7 +6,13 @@ from datetime import datetime, timezone
 
 import msgspec
 import pytest
-from _helpers import FAKE_DRIVER_NAME, make_amplifier_settings, make_settings, register_fake_driver
+from _helpers import (
+    FAKE_DRIVER_NAME,
+    make_amplifier_settings,
+    make_settings,
+    make_tcp_amplifier_settings,
+    register_fake_driver,
+)
 from scietex.hal.current_amplifier.base.capabilities import FilterType
 from scietex.hal.current_amplifier.base.data import AmplifierState, FilterSetting
 from scietex.service import ValkeyWorkerConfig
@@ -38,7 +44,9 @@ def _make_worker(tmp_path) -> CurrentAmplifierWorker:
 async def _worker_with_boards(tmp_path, labels: list[str]) -> CurrentAmplifierWorker:
     """Build a worker whose registry holds one fake board per label."""
     worker = _make_worker(tmp_path)
-    await worker._build_amplifiers(make_settings([make_amplifier_settings(label) for label in labels]))
+    await worker._build_amplifiers(
+        make_settings([make_amplifier_settings(label, port=f"/dev/ttyUSB{index}") for index, label in enumerate(labels)])
+    )
     return worker
 
 
@@ -129,6 +137,7 @@ async def test_devices_keyed_by_label_with_state_precedence(tmp_path) -> None:
     monitoring_device = telemetry.devices["b"]
     assert monitoring_device.state == "monitoring"
     assert monitoring_device.driver == FAKE_DRIVER_NAME
+    assert monitoring_device.transport == "rs485"
     assert monitoring_device.connected is True
     assert monitoring_device.monitoring is True
     assert monitoring_device.reading_count == 7
@@ -150,6 +159,27 @@ async def test_devices_keyed_by_label_with_state_precedence(tmp_path) -> None:
         "low_cutoff_hz": None,
         "high_cutoff_hz": 10_000.0,
     }
+
+    await worker.close_amplifiers()
+
+
+@pytest.mark.asyncio
+async def test_device_transport_matches_the_list_payload(tmp_path) -> None:
+    """Each telemetry entry carries the same transport as ``amplifier:list``."""
+    worker = _make_worker(tmp_path)
+    await worker._build_amplifiers(
+        make_settings(
+            [
+                make_amplifier_settings("wired", port="/dev/ttyUSB0"),
+                make_tcp_amplifier_settings("gatewayed", host="gateway.local"),
+            ]
+        )
+    )
+
+    devices = build_telemetry(worker).devices
+
+    assert devices["wired"].transport == "rs485"
+    assert devices["gatewayed"].transport == "tcp"
 
     await worker.close_amplifiers()
 
