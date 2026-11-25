@@ -199,6 +199,17 @@ for `linux/amd64` and `linux/arm64`. The image installs the released wheel from
 PyPI, so publish the version first. The rootfs is read-only-safe: only the
 mounted config volume is ever written.
 
+### Local build
+
+```bash
+podman build -f Containerfile.local -t scietex-current-amplifier-service:local .
+```
+
+`Containerfile.local` builds the same image from the working tree instead of the
+index, so it works before a version is published — the release build above
+installs `==${VERSION}` and fails until that version exists on PyPI. The release
+path is unchanged.
+
 ## Deployment
 
 The board is reached through an RS485 USB adapter, so the container needs the
