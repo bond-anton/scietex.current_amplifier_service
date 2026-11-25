@@ -121,6 +121,15 @@ over `t = serial.timeout`, `r = bus_retries`, `q = bus_queue_depth`. Do not leav
 unreachable board. Keep `tcp.retries: 0`: a retry after a timeout re-sends a
 request whose first copy may still be executing.
 
+**Gateway version requirement.** `scietex.hal.serial >= 2.7.0` on the gateway
+host. On 2.6.0 or earlier a lock-wait expiry is answered with Modbus exception
+`0x0B` (target device failed to respond) instead of `0x06` (server device busy),
+so bus contention is indistinguishable from an unreachable board and the service
+will report a healthy amplifier as unhealthy. The requirement cannot be enforced
+by dependency pins, because the gateway is a separate deployment: check the
+image tag of the `scietex.modbus_service` container rather than assuming pip
+resolved it.
+
 A configuration change at runtime is **restart-required**: the board registry is
 not live-rebuilt.
 
