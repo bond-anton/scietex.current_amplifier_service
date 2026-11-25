@@ -1,0 +1,32 @@
+[Unit]
+Description=Scietex current amplifier service (Modbus RTU)
+After=network-online.target
+Wants=network-online.target
+
+[Container]
+Image=registry.buro-nts.ru/scietex-current-amplifier-service:latest
+ContainerName=scietex-current-amplifier-service
+AutoUpdate=registry
+Environment=SCIETEX_SERVICE_NAME=CURRENT_AMPLIFIER
+Environment=SCIETEX_LOGGING_LEVEL=INFO
+# Podman 6.2 quadlet does not implement systemd's optional-file `-` prefix: it
+# would turn the path into a relative `<unitdir>/-%h/...`, so the file must exist.
+EnvironmentFile=%h/.config/scietex/current-amplifier.env
+# Bind mount rather than a named volume so
+# current_amplifier/current_amplifier.yml stays hand-editable on the host at
+# ~/.config/scietex/current_amplifier/current_amplifier.yml.
+Volume=%h/.config/scietex:/config:z
+AddDevice=/dev/ttyUSB0
+# The service only dials Valkey; it never listens. No PublishPort, no
+# NET_BIND_SERVICE.
+NoNewPrivileges=true
+ReadOnly=true
+Tmpfs=/tmp:rw,size=16m
+
+[Service]
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target

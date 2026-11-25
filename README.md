@@ -159,7 +159,7 @@ failures), and `MONITORING_FAILED`.
 ## Running
 
 ```bash
-start-current-amplifier-service --conf-dir /etc/scietex
+start-current-amplifier-service --conf-dir ~/.config/scietex
 ```
 
 Flags: `--conf-dir` (auto-resolved when omitted), `--service-name` (default
@@ -212,20 +212,67 @@ path is unchanged.
 
 ## Deployment
 
-The board is reached through an RS485 USB adapter, so the container needs the
-device and the adapter's group:
+The board is reached through an RS485 USB adapter, so the adapter node must be
+passed into the container:
 
 ```bash
-podman run -d \
-    --name current-amplifier-service \
-    --device=/dev/ttyUSB0 \
-    --group-add dialout \
-    -v /etc/scietex:/config:Z \
-    --read-only \
-    registry.buro-nts.ru/scietex-current-amplifier-service:0.1.0
+podman run --rm \
+    --device /dev/ttyUSB0 \
+    -v ~/.config/scietex:/config:z \
+    registry.buro-nts.ru/scietex-current-amplifier-service:latest
 ```
 
-`--device` exposes the adapter; `--group-add dialout` puts the container's
-non-root user in the group that owns `/dev/ttyUSB*` on the host. Adjust the
-group name when the host uses a different one (`ls -l /dev/ttyUSB0`). The config
-file is created under `/config/current_amplifier/` on first start.
+| Option | Purpose |
+| --- | --- |
+| `--device /dev/ttyUSB0` | Passes the adapter into the container |
+| `-v ~/.config/scietex:/config:z` | Host-owned config tree, SELinux-relabelled as shared (`:z`) |
+
+The config file is created under `~/.config/scietex/current_amplifier/` on first
+start. `:z` applies the shared SELinux relabel (`container_file_t`, no private
+MCS category), which is what a tree mounted by more than one container needs.
+Rootless, a non-root container user reaches the node only with the same three
+settings the Quadlet drop-in carries (`--userns=keep-id`,
+`--group-add keep-groups`, `--security-opt label=disable`).
+
+### Quadlet (systemd user unit)
+
+Install `deploy/current-amplifier-service.container` as
+`~/.config/containers/systemd/scietex-current-amplifier-service.container`
+and the serial drop-in as
+`~/.config/containers/systemd/scietex-current-amplifier-service.container.d/50-serial-devices.conf`,
+then reload and enable the generated unit:
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now scietex-current-amplifier-service
+```
+
+The `Volume=` line bind-mounts the host config tree instead of using a named
+volume, so `~/.config/scietex/current_amplifier/current_amplifier.yml` is
+editable on the host and survives container replacement; the service creates
+`current_amplifier/` and the YAML inside it on first start.
+`~/.config/scietex/current-amplifier.env` takes optional `KEY=VALUE` environment
+overrides. Create it before starting the unit — it may stay empty:
+`install -m 600 /dev/null ~/.config/scietex/current-amplifier.env`.
+
+The unit runs rootless, so the adapter is reachable only through the drop-in:
+`UserNS=keep-id` maps the container uid to your own user and
+`GroupAdd=keep-groups` passes your supplementary groups through. Your host user
+must therefore be in the group that owns `/dev/ttyUSB*`, normally `dialout`:
+
+```bash
+sudo usermod -aG dialout "$USER"
+```
+
+Log out and back in so the new group membership reaches the systemd user
+manager. Confirm the owning group with `ls -l /dev/ttyUSB0` and substitute a
+different name if your host uses one.
+
+Every `/dev/ttyUSB*` node a board names in `serial.port` must be passed into the
+container, so a board on an additional adapter needs its own `AddDevice=` line
+in the drop-in; boards that share a port share one RS485 segment. The board's
+`address` must match its Modbus slave address and stay unique on the segment.
+The `ttyUSB` number is assigned in enumeration order and can change across
+reboots or replugs, so pin a udev symlink when the assignment matters. The
+board's line settings must also match its `serial` block (19200 8-N-1 by
+default).
