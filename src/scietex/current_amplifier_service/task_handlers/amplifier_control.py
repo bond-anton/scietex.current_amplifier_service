@@ -1,4 +1,9 @@
-"""``amplifier:*`` data-plane tasks: read and control a single current amplifier.
+"""``current_amplifier:*`` data-plane tasks: read and control a single board.
+
+The task names and payload spellings are the api156 plugin's
+(``CURRENT_AMPLIFIER_TASKS`` / ``CURRENT_AMPLIFIER_COMMAND_FIELDS``), so a
+plugin-shaped command body decodes here unchanged. Matching is exact: the
+former ``amplifier:*`` namespace is gone, not aliased.
 
 Each task targets one device by the worker device id. Write tasks are gated on
 the board's declared capability set before dispatch: an unsupported command is
@@ -12,8 +17,10 @@ Boost-gain safety: switching gain engages the new relay before releasing the old
 one, so a ``10x <-> 30x`` change passes through about ``39x`` for the relay
 settle window. Never change gain during a measurement.
 
-``amplifier:list`` and ``amplifier:status`` answer from the worker's registry and
-poll counters only; they never touch the bus.
+``current_amplifier:list`` and ``current_amplifier:status`` answer from the
+worker's registry and poll counters only, and
+``current_amplifier:select-preamp-range`` is refused before dispatch; none of
+the three touches the bus.
 """
 
 from __future__ import annotations
@@ -43,40 +50,44 @@ if TYPE_CHECKING:
     from ..config import AmplifierTransportSettings
 
 #: Task name that lists the configured boards and their control surface.
-AMPLIFIER_LIST_TASK_NAME = "amplifier:list"
+AMPLIFIER_LIST_TASK_NAME = "current_amplifier:list"
 
 #: Task name that reports cached poll status for one board or every board.
-AMPLIFIER_STATUS_TASK_NAME = "amplifier:status"
+AMPLIFIER_STATUS_TASK_NAME = "current_amplifier:status"
 
 #: Task name that reads the live state of one board.
-AMPLIFIER_READ_TASK_NAME = "amplifier:read"
+AMPLIFIER_READ_TASK_NAME = "current_amplifier:read"
+
+#: Task name that selects the preamp range. Registered so the plugin's verb has
+#: an owner; always answers ``UNSUPPORTED`` because the HAL has no such method.
+AMPLIFIER_SELECT_PREAMP_RANGE_TASK_NAME = "current_amplifier:select-preamp-range"
 
 #: Task name that selects the feedback (transimpedance) resistor.
-AMPLIFIER_SET_FEEDBACK_RESISTOR_TASK_NAME = "amplifier:set-feedback-resistor"
+AMPLIFIER_SET_FEEDBACK_RESISTOR_TASK_NAME = "current_amplifier:select-feedback-resistor"
 
 #: Task name that selects the boost stage gain.
-AMPLIFIER_SET_BOOST_GAIN_TASK_NAME = "amplifier:set-boost-gain"
+AMPLIFIER_SET_BOOST_GAIN_TASK_NAME = "current_amplifier:set-boost-gain"
 
 #: Task name that switches DC bias injection on or off.
-AMPLIFIER_SET_DC_BIAS_TASK_NAME = "amplifier:set-dc-bias"
+AMPLIFIER_SET_DC_BIAS_TASK_NAME = "current_amplifier:set-dc-bias"
 
 #: Task name that writes the DC bias level.
-AMPLIFIER_SET_DC_BIAS_LEVEL_TASK_NAME = "amplifier:set-dc-bias-level"
+AMPLIFIER_SET_DC_BIAS_LEVEL_TASK_NAME = "current_amplifier:set-dc-bias-level"
 
 #: Task name that writes the bandwidth.
-AMPLIFIER_SET_BANDWIDTH_TASK_NAME = "amplifier:set-bandwidth"
+AMPLIFIER_SET_BANDWIDTH_TASK_NAME = "current_amplifier:set-bandwidth"
 
 #: Task name that writes one filter entry.
-AMPLIFIER_SET_FILTER_TASK_NAME = "amplifier:set-filter"
+AMPLIFIER_SET_FILTER_TASK_NAME = "current_amplifier:set-filter"
 
 #: Task name that switches input-capacitance compensation on or off.
-AMPLIFIER_SET_INPUT_COMPENSATION_TASK_NAME = "amplifier:set-input-compensation"
+AMPLIFIER_SET_INPUT_COMPENSATION_TASK_NAME = "current_amplifier:set-input-compensation"
 
 #: Task name that writes the input-compensation level.
-AMPLIFIER_SET_INPUT_COMPENSATION_LEVEL_TASK_NAME = "amplifier:set-input-compensation-level"
+AMPLIFIER_SET_INPUT_COMPENSATION_LEVEL_TASK_NAME = "current_amplifier:set-input-compensation-level"
 
 #: Task name that switches output-polarity inversion on or off.
-AMPLIFIER_SET_INVERTED_TASK_NAME = "amplifier:set-inverted"
+AMPLIFIER_SET_INVERTED_TASK_NAME = "current_amplifier:set-inverted"
 
 #: Gain domain of the EBIC boost stage, used when a driver declares write access
 #: without enumerating its options. The eight-resistor preamp is enumerated on
@@ -90,13 +101,24 @@ DEFAULT_BOOST_GAINS: frozenset[float] = frozenset({1.0, 3.0, 10.0, 30.0})
 #: branch on instead. Replaying such a write could repeat a hardware transition.
 AMPLIFIER_WRITE_OUTCOME_UNKNOWN: str = "AMPLIFIER_WRITE_OUTCOME_UNKNOWN"
 
+#: Why ``current_amplifier:select-preamp-range`` always answers ``UNSUPPORTED``.
+#:
+#: The HAL exposes ``select_feedback_resistor`` only. A preamp *range* is a
+#: distinct volt-domain selector with no HAL method, and inventing a
+#: range-to-resistance mapping would guess at board semantics. A future HAL
+#: release can add the method and this task becomes one dispatch row.
+PREAMP_RANGE_UNSUPPORTED_REASON: str = (
+    "the HAL exposes select_feedback_resistor only; a preamp range is a volt-domain "
+    "selector with no HAL method, so no range-to-resistance mapping is defined"
+)
+
 #: Bound on the cause/context walk. A longer chain is pathological, and a
 #: hand-built exception may even point at itself, so the walk must terminate.
 _MAX_EXCEPTION_CHAIN: int = 8
 
 
 class AmplifierStatusRequest(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
-    """Request payload for ``amplifier:status``.
+    """Request payload for ``current_amplifier:status``.
 
     Args:
         device: Worker device id to report; ``None`` (or an empty payload)
@@ -107,35 +129,51 @@ class AmplifierStatusRequest(msgspec.Struct, frozen=True, forbid_unknown_fields=
 
 
 class AmplifierCommandRequest(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
-    """Request payload for ``amplifier:read`` and the ``amplifier:set-*`` tasks.
+    """Request payload for ``current_amplifier:read`` and the write tasks.
 
-    Only the fields relevant to the task are read; a field the task needs but
-    the payload omits is rejected as ``INVALID_PARAMETERS``. One struct keeps
-    the wire surface flat — the task name already says which fields apply.
+    Field-for-field the plugin's ``CurrentAmplifierCommandRequest`` minus
+    ``task``, which the plugin keeps in the task envelope. Only the fields
+    relevant to the task are read; a field the task needs but the payload omits
+    is rejected as ``INVALID_PARAMETERS``. One struct keeps the wire surface
+    flat — the task name already says which fields apply — and every verb has
+    its own spelling, because the plugin spells the argument per verb.
 
     Args:
         device: Worker device id to target (required).
-        resistance_ohm: Feedback resistor for ``amplifier:set-feedback-resistor``.
-        gain: Boost gain for ``amplifier:set-boost-gain``.
-        enabled: Switch state for the enable/disable tasks and the filter.
-        level: Device-native level for the level tasks.
-        bandwidth_hz: Bandwidth for ``amplifier:set-bandwidth``, in Hz.
-        filter_type: Filter response for ``amplifier:set-filter``, spelled as a
-            `FilterType` value (``low_pass``, ``high_pass``, ``band_pass``).
-        low_cutoff_hz: Lower filter corner for ``amplifier:set-filter``, in Hz.
-        high_cutoff_hz: Upper filter corner for ``amplifier:set-filter``, in Hz.
-        inverted: Output-polarity state for ``amplifier:set-inverted``.
+        preamp_range: Preamp range for ``current_amplifier:select-preamp-range``.
+        feedback_resistor_ohm: Feedback resistor for
+            ``current_amplifier:select-feedback-resistor``.
+        boost_gain: Boost gain for ``current_amplifier:set-boost-gain``.
+        dc_bias_enabled: Switch state for ``current_amplifier:set-dc-bias``.
+        dc_bias_level: Device-native level for
+            ``current_amplifier:set-dc-bias-level``.
+        bandwidth_hz: Bandwidth for ``current_amplifier:set-bandwidth``, in Hz.
+        filter_type: Filter response for ``current_amplifier:set-filter``,
+            spelled as a `FilterType` value (``low_pass``, ``high_pass``,
+            ``band_pass``).
+        filter_enabled: Switch state of the filter entry.
+        filter_low_cutoff_hz: Lower filter corner, in Hz.
+        filter_high_cutoff_hz: Upper filter corner, in Hz.
+        input_compensation_enabled: Switch state for
+            ``current_amplifier:set-input-compensation``.
+        input_compensation_level: Device-native level for
+            ``current_amplifier:set-input-compensation-level``.
+        inverted: Output-polarity state for ``current_amplifier:set-inverted``.
     """
 
     device: str
-    resistance_ohm: float | None = None
-    gain: float | None = None
-    enabled: bool | None = None
-    level: float | None = None
+    preamp_range: float | None = None
+    feedback_resistor_ohm: float | None = None
+    boost_gain: float | None = None
+    dc_bias_enabled: bool | None = None
+    dc_bias_level: float | None = None
     bandwidth_hz: float | None = None
     filter_type: str | None = None
-    low_cutoff_hz: float | None = None
-    high_cutoff_hz: float | None = None
+    filter_enabled: bool | None = None
+    filter_low_cutoff_hz: float | None = None
+    filter_high_cutoff_hz: float | None = None
+    input_compensation_enabled: bool | None = None
+    input_compensation_level: float | None = None
     inverted: bool | None = None
 
 
@@ -203,7 +241,7 @@ class AmplifierInfo(msgspec.Struct, frozen=True):
 
 
 class AmplifierListResponse(msgspec.Struct, frozen=True):
-    """Result payload of ``amplifier:list``.
+    """Result payload of ``current_amplifier:list``.
 
     Args:
         service: Service name the worker runs as.
@@ -244,7 +282,7 @@ class AmplifierStatus(msgspec.Struct, frozen=True):
 
 
 class AmplifierStatusResponse(msgspec.Struct, frozen=True):
-    """Result payload of ``amplifier:status``.
+    """Result payload of ``current_amplifier:status``.
 
     Args:
         amplifiers: One entry per requested device, sorted by device id unless a
@@ -255,14 +293,14 @@ class AmplifierStatusResponse(msgspec.Struct, frozen=True):
 
 
 class AmplifierCommandResponse(msgspec.Struct, frozen=True):
-    """Result payload of ``amplifier:read`` and the ``amplifier:set-*`` tasks.
+    """Result payload of ``current_amplifier:read`` and the write tasks.
 
     Args:
         device: Worker device id the command targeted.
         task: Task name that ran.
         applied: Values the command wrote, echoed in request spelling.
         state: State snapshot read back after the command; present for
-            ``amplifier:read`` and for writes that re-read the board.
+            ``current_amplifier:read`` and for writes that re-read the board.
         readback_error: ``"<ExcType>: <msg>"`` when a write landed but its
             follow-up read failed; the command still succeeded. ``None``
             otherwise.
@@ -298,7 +336,7 @@ class AmplifierCommandError(msgspec.Struct, frozen=True):
 
 @dataclass(frozen=True, slots=True)
 class _Command:
-    """One ``amplifier:set-*`` task: its capability gate and dispatch row.
+    """One write task: its capability gate and dispatch row.
 
     Args:
         gates: Dotted paths from the amplifier instance to the capabilities
@@ -583,22 +621,22 @@ def _endpoint(transport: AmplifierTransportSettings) -> str:
 
 async def _apply_feedback_resistor(amplifier: CurrentAmplifierProtocol, request: AmplifierCommandRequest) -> None:
     """Select the feedback resistor; the driver keeps the loop closed while switching."""
-    await amplifier.select_feedback_resistor(cast(float, request.resistance_ohm))
+    await amplifier.select_feedback_resistor(cast(float, request.feedback_resistor_ohm))
 
 
 async def _apply_boost_gain(amplifier: CurrentAmplifierProtocol, request: AmplifierCommandRequest) -> None:
     """Select the boost gain; never call this during a measurement."""
-    await amplifier.set_boost_gain(cast(float, request.gain))
+    await amplifier.set_boost_gain(cast(float, request.boost_gain))
 
 
 async def _apply_dc_bias(amplifier: CurrentAmplifierProtocol, request: AmplifierCommandRequest) -> None:
     """Switch DC bias injection."""
-    await amplifier.set_dc_bias(cast(bool, request.enabled))
+    await amplifier.set_dc_bias(cast(bool, request.dc_bias_enabled))
 
 
 async def _apply_dc_bias_level(amplifier: CurrentAmplifierProtocol, request: AmplifierCommandRequest) -> None:
     """Write the DC bias level in device-native units."""
-    await amplifier.set_dc_bias_level(cast(float, request.level))
+    await amplifier.set_dc_bias_level(cast(float, request.dc_bias_level))
 
 
 async def _apply_bandwidth(amplifier: CurrentAmplifierProtocol, request: AmplifierCommandRequest) -> None:
@@ -607,24 +645,24 @@ async def _apply_bandwidth(amplifier: CurrentAmplifierProtocol, request: Amplifi
 
 
 async def _apply_filter(amplifier: CurrentAmplifierProtocol, request: AmplifierCommandRequest) -> None:
-    """Write one filter entry; an omitted ``enabled`` leaves the filter off."""
+    """Write one filter entry; an omitted ``filter_enabled`` leaves the filter off."""
     setting = FilterSetting(
         type=FilterType(cast(str, request.filter_type)),
-        enabled=bool(request.enabled),
-        low_cutoff_hz=request.low_cutoff_hz,
-        high_cutoff_hz=request.high_cutoff_hz,
+        enabled=bool(request.filter_enabled),
+        low_cutoff_hz=request.filter_low_cutoff_hz,
+        high_cutoff_hz=request.filter_high_cutoff_hz,
     )
     await amplifier.set_filter(setting)
 
 
 async def _apply_input_compensation(amplifier: CurrentAmplifierProtocol, request: AmplifierCommandRequest) -> None:
     """Switch input-capacitance compensation."""
-    await amplifier.set_input_compensation(cast(bool, request.enabled))
+    await amplifier.set_input_compensation(cast(bool, request.input_compensation_enabled))
 
 
 async def _apply_input_compensation_level(amplifier: CurrentAmplifierProtocol, request: AmplifierCommandRequest) -> None:
     """Write the compensation level in device-native units."""
-    await amplifier.set_input_compensation_level(cast(float, request.level))
+    await amplifier.set_input_compensation_level(cast(float, request.input_compensation_level))
 
 
 async def _apply_inverted(amplifier: CurrentAmplifierProtocol, request: AmplifierCommandRequest) -> None:
@@ -635,16 +673,18 @@ async def _apply_inverted(amplifier: CurrentAmplifierProtocol, request: Amplifie
 def _validate_feedback_resistor(request: AmplifierCommandRequest, amplifier: CurrentAmplifierProtocol) -> TaskResult | None:
     """Reject a resistance that is not one of the board's enumerated resistors."""
     options = _options(amplifier, "capabilities.preamp.feedback_resistor.options")
-    if request.resistance_ohm not in options:
-        return _invalid_parameters(f"resistance_ohm must be one of {sorted(options)}, got {request.resistance_ohm!r}")
+    if request.feedback_resistor_ohm not in options:
+        return _invalid_parameters(
+            f"feedback_resistor_ohm must be one of {sorted(options)}, got {request.feedback_resistor_ohm!r}"
+        )
     return None
 
 
 def _validate_boost_gain(request: AmplifierCommandRequest, amplifier: CurrentAmplifierProtocol) -> TaskResult | None:
     """Reject a gain outside the board's enumerated boost gains."""
     options = _boost_options(amplifier)
-    if request.gain not in options:
-        return _invalid_parameters(f"gain must be one of {sorted(options)}, got {request.gain!r}")
+    if request.boost_gain not in options:
+        return _invalid_parameters(f"boost_gain must be one of {sorted(options)}, got {request.boost_gain!r}")
     return None
 
 
@@ -667,29 +707,29 @@ _COMMAND_BY_TASK: dict[str, _Command] = {
     AMPLIFIER_SET_FEEDBACK_RESISTOR_TASK_NAME: _Command(
         gates=("can_select_preamp",),
         apply=_apply_feedback_resistor,
-        echo=("resistance_ohm",),
-        required=("resistance_ohm",),
+        echo=("feedback_resistor_ohm",),
+        required=("feedback_resistor_ohm",),
         validate=_validate_feedback_resistor,
         read_back=True,
     ),
     AMPLIFIER_SET_BOOST_GAIN_TASK_NAME: _Command(
         gates=("can_set_boost",),
         apply=_apply_boost_gain,
-        echo=("gain",),
-        required=("gain",),
+        echo=("boost_gain",),
+        required=("boost_gain",),
         validate=_validate_boost_gain,
     ),
     AMPLIFIER_SET_DC_BIAS_TASK_NAME: _Command(
         gates=("capabilities.dc_bias.enabled.write",),
         apply=_apply_dc_bias,
-        echo=("enabled",),
-        required=("enabled",),
+        echo=("dc_bias_enabled",),
+        required=("dc_bias_enabled",),
     ),
     AMPLIFIER_SET_DC_BIAS_LEVEL_TASK_NAME: _Command(
         gates=("capabilities.dc_bias.level.write",),
         apply=_apply_dc_bias_level,
-        echo=("level",),
-        required=("level",),
+        echo=("dc_bias_level",),
+        required=("dc_bias_level",),
     ),
     AMPLIFIER_SET_BANDWIDTH_TASK_NAME: _Command(
         gates=("can_set_bandwidth",),
@@ -700,25 +740,25 @@ _COMMAND_BY_TASK: dict[str, _Command] = {
     AMPLIFIER_SET_FILTER_TASK_NAME: _Command(
         gates=("capabilities.filters.enabled.write",),
         apply=_apply_filter,
-        echo=("filter_type", "enabled", "low_cutoff_hz", "high_cutoff_hz"),
+        echo=("filter_type", "filter_enabled", "filter_low_cutoff_hz", "filter_high_cutoff_hz"),
         required=("filter_type",),
         validate=_validate_filter,
         conditional_gates=(
-            ("low_cutoff_hz", ("capabilities.filters.cutoff.write",)),
-            ("high_cutoff_hz", ("capabilities.filters.cutoff.write",)),
+            ("filter_low_cutoff_hz", ("capabilities.filters.cutoff.write",)),
+            ("filter_high_cutoff_hz", ("capabilities.filters.cutoff.write",)),
         ),
     ),
     AMPLIFIER_SET_INPUT_COMPENSATION_TASK_NAME: _Command(
         gates=("capabilities.input_compensation.enabled.write",),
         apply=_apply_input_compensation,
-        echo=("enabled",),
-        required=("enabled",),
+        echo=("input_compensation_enabled",),
+        required=("input_compensation_enabled",),
     ),
     AMPLIFIER_SET_INPUT_COMPENSATION_LEVEL_TASK_NAME: _Command(
         gates=("capabilities.input_compensation.level.write",),
         apply=_apply_input_compensation_level,
-        echo=("level",),
-        required=("level",),
+        echo=("input_compensation_level",),
+        required=("input_compensation_level",),
     ),
     AMPLIFIER_SET_INVERTED_TASK_NAME: _Command(
         gates=("can_set_invert_output",),
@@ -730,7 +770,7 @@ _COMMAND_BY_TASK: dict[str, _Command] = {
 
 
 class AmplifierControlHandler(TaskHandler):
-    """Handle the ``amplifier:*`` tasks on the data lane.
+    """Handle the ``current_amplifier:*`` tasks on the data lane.
 
     The worker is injected as a constructor keyword argument (``worker=``) via
     ``add_task_handler`` — the handler context carries no worker reference.
@@ -756,11 +796,12 @@ class AmplifierControlHandler(TaskHandler):
             AMPLIFIER_LIST_TASK_NAME,
             AMPLIFIER_STATUS_TASK_NAME,
             AMPLIFIER_READ_TASK_NAME,
+            AMPLIFIER_SELECT_PREAMP_RANGE_TASK_NAME,
             *_COMMAND_BY_TASK,
         ]
 
     async def handle(self, task_data: TaskData, *, capabilities: TaskCapabilities) -> TaskResult:
-        """Execute one ``amplifier:*`` command against the targeted device.
+        """Execute one ``current_amplifier:*`` command against the targeted device.
 
         Checks, in order: payload decode, device lookup, capability gate,
         parameter presence and domain, then dispatch. A write exception is
@@ -787,6 +828,18 @@ class AmplifierControlHandler(TaskHandler):
 
         if task == AMPLIFIER_READ_TASK_NAME:
             return await self._read(task, device, amplifier)
+
+        if task == AMPLIFIER_SELECT_PREAMP_RANGE_TASK_NAME:
+            # WHY: the verb has an owner so the plugin's whole catalogue lands
+            # here, but a range cannot be mapped to a feedback resistance
+            # without inventing board semantics. Answer the terminal verdict
+            # instead of dispatching to a driver method that does not exist.
+            return TaskResult(
+                status="error",
+                error=f"{task} is unsupported: {PREAMP_RANGE_UNSUPPORTED_REASON}",
+                error_code="UNSUPPORTED",
+                retryable=False,
+            )
 
         command = _COMMAND_BY_TASK[task]
         unsupported_gate = next(

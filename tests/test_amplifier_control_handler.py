@@ -1,4 +1,4 @@
-"""Tests for the ``amplifier:*`` data-plane task handler."""
+"""Tests for the ``current_amplifier:*`` data-plane task handler."""
 
 from __future__ import annotations
 
@@ -46,6 +46,7 @@ from scietex.current_amplifier_service.config import (
 from scietex.current_amplifier_service.task_handlers import (
     AMPLIFIER_LIST_TASK_NAME,
     AMPLIFIER_READ_TASK_NAME,
+    AMPLIFIER_SELECT_PREAMP_RANGE_TASK_NAME,
     AMPLIFIER_SET_BANDWIDTH_TASK_NAME,
     AMPLIFIER_SET_BOOST_GAIN_TASK_NAME,
     AMPLIFIER_SET_DC_BIAS_LEVEL_TASK_NAME,
@@ -57,6 +58,7 @@ from scietex.current_amplifier_service.task_handlers import (
     AMPLIFIER_SET_INVERTED_TASK_NAME,
     AMPLIFIER_STATUS_TASK_NAME,
     AMPLIFIER_WRITE_OUTCOME_UNKNOWN,
+    PREAMP_RANGE_UNSUPPORTED_REASON,
     AmplifierCommandError,
     AmplifierCommandResponse,
     AmplifierControlHandler,
@@ -91,7 +93,59 @@ _ALL_TASK_NAMES = [
     AMPLIFIER_LIST_TASK_NAME,
     AMPLIFIER_STATUS_TASK_NAME,
     AMPLIFIER_READ_TASK_NAME,
+    AMPLIFIER_SELECT_PREAMP_RANGE_TASK_NAME,
     *_WRITE_TASK_NAMES,
+]
+
+#: The plugin's ``CURRENT_AMPLIFIER_TASKS``, copied verbatim from
+#: ``api156/equipment/current_amplifier/controllers.py``. The worker serves
+#: every one of these plus its registry-only ``list`` and ``status`` verbs.
+PLUGIN_TASKS: frozenset[str] = frozenset(
+    {
+        "current_amplifier:read",
+        "current_amplifier:select-preamp-range",
+        "current_amplifier:select-feedback-resistor",
+        "current_amplifier:set-boost-gain",
+        "current_amplifier:set-dc-bias",
+        "current_amplifier:set-dc-bias-level",
+        "current_amplifier:set-bandwidth",
+        "current_amplifier:set-filter",
+        "current_amplifier:set-input-compensation",
+        "current_amplifier:set-input-compensation-level",
+        "current_amplifier:set-inverted",
+    }
+)
+
+#: The plugin's ``CURRENT_AMPLIFIER_COMMAND_FIELDS``, copied verbatim. Those are
+#: the only payload keys the plugin ever forwards besides ``device``.
+PLUGIN_COMMAND_FIELDS: tuple[str, ...] = (
+    "preamp_range",
+    "feedback_resistor_ohm",
+    "boost_gain",
+    "dc_bias_enabled",
+    "dc_bias_level",
+    "bandwidth_hz",
+    "filter_type",
+    "filter_enabled",
+    "filter_low_cutoff_hz",
+    "filter_high_cutoff_hz",
+    "input_compensation_enabled",
+    "input_compensation_level",
+    "inverted",
+)
+
+#: The old worker spellings that must no longer decode.
+_OLD_FIELD_PAYLOADS = [
+    (AMPLIFIER_READ_TASK_NAME, {"device": DEVICE, "label": DEVICE}),
+    (AMPLIFIER_SET_FEEDBACK_RESISTOR_TASK_NAME, {"device": DEVICE, "resistance_ohm": 1_000_000.0}),
+    (AMPLIFIER_SET_BOOST_GAIN_TASK_NAME, {"device": DEVICE, "gain": 10.0}),
+    (AMPLIFIER_SET_DC_BIAS_TASK_NAME, {"device": DEVICE, "enabled": True}),
+    (AMPLIFIER_SET_DC_BIAS_LEVEL_TASK_NAME, {"device": DEVICE, "level": 0.5}),
+    (AMPLIFIER_SET_FILTER_TASK_NAME, {"device": DEVICE, "filter_type": "low_pass", "enabled": True}),
+    (AMPLIFIER_SET_FILTER_TASK_NAME, {"device": DEVICE, "filter_type": "low_pass", "low_cutoff_hz": 10.0}),
+    (AMPLIFIER_SET_FILTER_TASK_NAME, {"device": DEVICE, "filter_type": "low_pass", "high_cutoff_hz": 1_000.0}),
+    (AMPLIFIER_SET_INPUT_COMPENSATION_TASK_NAME, {"device": DEVICE, "enabled": True}),
+    (AMPLIFIER_SET_INPUT_COMPENSATION_LEVEL_TASK_NAME, {"device": DEVICE, "level": 0.25}),
 ]
 
 
@@ -376,17 +430,33 @@ def test_handler_is_data_lane() -> None:
     assert AmplifierControlHandler.control is False
 
 
-def test_supported_tasks_are_the_twelve_amplifier_tasks() -> None:
-    """The handler declares exactly the twelve ``amplifier:*`` task names."""
+def test_supported_tasks_are_exactly_the_plugin_catalogue_plus_registry_verbs() -> None:
+    """The handler serves the plugin's whole catalogue and nothing else.
+
+    ``list`` and ``status`` are worker registry verbs the plugin has no
+    counterpart for; every other name is the plugin's, spelled as it emits it.
+    A task added here without a matching plugin entry fails this assertion.
+    """
+    handler = _handler(_StubWorker())
+    expected = PLUGIN_TASKS | {AMPLIFIER_LIST_TASK_NAME, AMPLIFIER_STATUS_TASK_NAME}
+
+    assert set(handler.supported_tasks) == expected
+    assert set(_ALL_TASK_NAMES) == expected
+    assert len(handler.supported_tasks) == len(expected)
+    assert all(name.startswith("current_amplifier:") for name in handler.supported_tasks)
+
+
+def test_unknown_and_legacy_task_names_are_not_handled() -> None:
+    """Matching is by exact name: no prefix fallback and no ``amplifier:*`` alias."""
     handler = _handler(_StubWorker())
 
-    assert len(handler.supported_tasks) == 12
-    assert set(handler.supported_tasks) == set(_ALL_TASK_NAMES)
-    assert all(name.startswith("amplifier:") for name in handler.supported_tasks)
+    assert "current_amplifier:no-such-verb" not in handler.supported_tasks
+    assert "amplifier:read" not in handler.supported_tasks
+    assert "amplifier:list" not in handler.supported_tasks
 
 
 async def _list(worker: _StubWorker) -> AmplifierListResponse:
-    """Dispatch ``amplifier:list`` and decode its response."""
+    """Dispatch ``current_amplifier:list`` and decode its response."""
     result = await _handler(worker).handle(_make_task(AMPLIFIER_LIST_TASK_NAME, None), capabilities=_make_capabilities())
     assert result.status == "success"
     return msgspec.json.decode(result.payload, type=AmplifierListResponse)
@@ -394,7 +464,7 @@ async def _list(worker: _StubWorker) -> AmplifierListResponse:
 
 @pytest.mark.asyncio
 async def test_list_reports_every_board_without_driver_io() -> None:
-    """``amplifier:list`` answers from the registry and never touches the driver."""
+    """``current_amplifier:list`` answers from the registry and never touches the driver."""
     worker = _worker("b", "a", strict=True)
 
     response = await _list(worker)
@@ -527,7 +597,7 @@ async def test_list_control_summary_gates_on_the_field_each_task_writes() -> Non
 
 @pytest.mark.asyncio
 async def test_status_reports_cached_values_only() -> None:
-    """``amplifier:status`` renders the poll counters and never reads the board."""
+    """``current_amplifier:status`` renders the poll counters and never reads the board."""
     amplifier = _RecordingAmplifier(strict=True)
     worker = _worker_for(amplifier)
     worker.connected[DEVICE] = True
@@ -604,7 +674,7 @@ async def test_status_malformed_payload_is_rejected() -> None:
 
 @pytest.mark.asyncio
 async def test_read_calls_the_driver_once_and_renders_filters() -> None:
-    """``amplifier:read`` performs one live read and returns filters as dicts."""
+    """``current_amplifier:read`` performs one live read and returns filters as dicts."""
     amplifier = _RecordingAmplifier(state=_make_state(filters=(_FILTER,)))
     worker = _worker_for(amplifier)
 
@@ -661,34 +731,34 @@ async def test_read_driver_failure_is_retryable() -> None:
 _WRITE_CASES = [
     (
         AMPLIFIER_SET_FEEDBACK_RESISTOR_TASK_NAME,
-        {"device": DEVICE, "resistance_ohm": 1_000_000.0},
+        {"device": DEVICE, "feedback_resistor_ohm": 1_000_000.0},
         "select_feedback_resistor_calls",
         1_000_000.0,
-        {"resistance_ohm": 1_000_000.0},
+        {"feedback_resistor_ohm": 1_000_000.0},
         True,
     ),
     (
         AMPLIFIER_SET_BOOST_GAIN_TASK_NAME,
-        {"device": DEVICE, "gain": 10.0},
+        {"device": DEVICE, "boost_gain": 10.0},
         "set_boost_gain_calls",
         10.0,
-        {"gain": 10.0},
+        {"boost_gain": 10.0},
         False,
     ),
     (
         AMPLIFIER_SET_DC_BIAS_TASK_NAME,
-        {"device": DEVICE, "enabled": False},
+        {"device": DEVICE, "dc_bias_enabled": False},
         "set_dc_bias_calls",
         False,
-        {"enabled": False},
+        {"dc_bias_enabled": False},
         False,
     ),
     (
         AMPLIFIER_SET_DC_BIAS_LEVEL_TASK_NAME,
-        {"device": DEVICE, "level": 0.5},
+        {"device": DEVICE, "dc_bias_level": 0.5},
         "set_dc_bias_level_calls",
         0.5,
-        {"level": 0.5},
+        {"dc_bias_level": 0.5},
         False,
     ),
     (
@@ -701,26 +771,37 @@ _WRITE_CASES = [
     ),
     (
         AMPLIFIER_SET_FILTER_TASK_NAME,
-        {"device": DEVICE, "filter_type": "low_pass", "enabled": True, "low_cutoff_hz": 10.0, "high_cutoff_hz": 1_000.0},
+        {
+            "device": DEVICE,
+            "filter_type": "low_pass",
+            "filter_enabled": True,
+            "filter_low_cutoff_hz": 10.0,
+            "filter_high_cutoff_hz": 1_000.0,
+        },
         "set_filter_calls",
         FilterSetting(type=FilterType.LOW_PASS, enabled=True, low_cutoff_hz=10.0, high_cutoff_hz=1_000.0),
-        {"filter_type": "low_pass", "enabled": True, "low_cutoff_hz": 10.0, "high_cutoff_hz": 1_000.0},
+        {
+            "filter_type": "low_pass",
+            "filter_enabled": True,
+            "filter_low_cutoff_hz": 10.0,
+            "filter_high_cutoff_hz": 1_000.0,
+        },
         False,
     ),
     (
         AMPLIFIER_SET_INPUT_COMPENSATION_TASK_NAME,
-        {"device": DEVICE, "enabled": True},
+        {"device": DEVICE, "input_compensation_enabled": True},
         "set_input_compensation_calls",
         True,
-        {"enabled": True},
+        {"input_compensation_enabled": True},
         False,
     ),
     (
         AMPLIFIER_SET_INPUT_COMPENSATION_LEVEL_TASK_NAME,
-        {"device": DEVICE, "level": 0.25},
+        {"device": DEVICE, "input_compensation_level": 0.25},
         "set_input_compensation_level_calls",
         0.25,
-        {"level": 0.25},
+        {"input_compensation_level": 0.25},
         False,
     ),
     (
@@ -737,7 +818,7 @@ _WRITE_CASES = [
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("task", "payload", "recorder", "expected", "applied", "read_back"), _WRITE_CASES)
 async def test_write_forwards_the_exact_argument(task, payload, recorder, expected, applied, read_back) -> None:
-    """Every ``amplifier:set-*`` task forwards its argument unchanged and echoes it."""
+    """Every write task forwards its argument unchanged and echoes it."""
     amplifier = _RecordingAmplifier()
     worker = _worker_for(amplifier)
 
@@ -759,6 +840,119 @@ async def test_write_forwards_the_exact_argument(task, payload, recorder, expect
         assert response.state is None
 
 
+#: One verbatim plugin payload per write task, spelled exactly as the plugin
+#: emits it: ``_command_payload`` starts from ``{"device": ...}`` and adds only
+#: the non-``None`` members of `PLUGIN_COMMAND_FIELDS`. The values are the
+#: board's enumerated options, so a correct dispatch is observable on the fake.
+_PLUGIN_WRITE_COMMANDS = [
+    (
+        AMPLIFIER_SET_FEEDBACK_RESISTOR_TASK_NAME,
+        {"device": DEVICE, "feedback_resistor_ohm": 1_000_000.0},
+        "select_feedback_resistor_calls",
+        1_000_000.0,
+    ),
+    (AMPLIFIER_SET_BOOST_GAIN_TASK_NAME, {"device": DEVICE, "boost_gain": 10.0}, "set_boost_gain_calls", 10.0),
+    (AMPLIFIER_SET_DC_BIAS_TASK_NAME, {"device": DEVICE, "dc_bias_enabled": True}, "set_dc_bias_calls", True),
+    (AMPLIFIER_SET_DC_BIAS_LEVEL_TASK_NAME, {"device": DEVICE, "dc_bias_level": 0.5}, "set_dc_bias_level_calls", 0.5),
+    (AMPLIFIER_SET_BANDWIDTH_TASK_NAME, {"device": DEVICE, "bandwidth_hz": 1_000.0}, "set_bandwidth_calls", 1_000.0),
+    (
+        AMPLIFIER_SET_FILTER_TASK_NAME,
+        {
+            "device": DEVICE,
+            "filter_type": "low_pass",
+            "filter_enabled": True,
+            "filter_low_cutoff_hz": 10.0,
+            "filter_high_cutoff_hz": 1_000.0,
+        },
+        "set_filter_calls",
+        FilterSetting(type=FilterType.LOW_PASS, enabled=True, low_cutoff_hz=10.0, high_cutoff_hz=1_000.0),
+    ),
+    (
+        AMPLIFIER_SET_INPUT_COMPENSATION_TASK_NAME,
+        {"device": DEVICE, "input_compensation_enabled": True},
+        "set_input_compensation_calls",
+        True,
+    ),
+    (
+        AMPLIFIER_SET_INPUT_COMPENSATION_LEVEL_TASK_NAME,
+        {"device": DEVICE, "input_compensation_level": 0.25},
+        "set_input_compensation_level_calls",
+        0.25,
+    ),
+    (AMPLIFIER_SET_INVERTED_TASK_NAME, {"device": DEVICE, "inverted": True}, "set_inverted_calls", True),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("task", "payload", "recorder", "expected"), _PLUGIN_WRITE_COMMANDS)
+async def test_plugin_command_payload_decodes_and_dispatches(task, payload, recorder, expected) -> None:
+    """A verbatim plugin body decodes and reaches the targeted board's driver.
+
+    The payload is the plugin's own shape, not a worker-friendly variant: the
+    only keys are ``device`` and members of `PLUGIN_COMMAND_FIELDS`. The worker
+    must resolve the addressed device id out of a two-board registry, so the
+    other board's driver must stay untouched.
+    """
+    assert task in PLUGIN_TASKS
+    assert set(payload) - {"device"} <= set(PLUGIN_COMMAND_FIELDS)
+    worker = _worker(DEVICE, "b")
+    amplifier = worker.amplifiers[DEVICE]
+    other = worker.amplifiers["b"]
+
+    result = await _handler(worker).handle(_raw_task(task, msgspec.json.encode(payload)), capabilities=_make_capabilities())
+
+    assert result.status == "success"
+    response = msgspec.json.decode(result.payload, type=AmplifierCommandResponse)
+    assert response.device == DEVICE
+    assert response.task == task
+    assert response.applied == {key: value for key, value in payload.items() if key != "device"}
+    assert response.readback_error is None
+    assert getattr(amplifier, recorder) == [expected]
+    assert all(calls == [] for calls in _all_control_calls(other))
+    assert other.read_calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("task", "payload"), _OLD_FIELD_PAYLOADS)
+async def test_old_worker_spellings_no_longer_decode(task, payload) -> None:
+    """Every superseded field spelling is INVALID_PAYLOAD: no alias survives."""
+    amplifier = _RecordingAmplifier(strict=True)
+    worker = _worker_for(amplifier)
+
+    result = await _handler(worker).handle(_raw_task(task, msgspec.json.encode(payload)), capabilities=_make_capabilities())
+
+    assert result.status == "error"
+    assert result.error_code == "INVALID_PAYLOAD"
+    assert result.retryable is False
+    assert all(calls == [] for calls in _all_control_calls(amplifier))
+    assert amplifier.read_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_select_preamp_range_is_registered_but_unsupported() -> None:
+    """The plugin's preamp-range verb answers UNSUPPORTED with the HAL reason.
+
+    The HAL exposes ``select_feedback_resistor`` only, and a range-to-resistance
+    mapping would guess at board semantics, so the handler must neither invent
+    one nor reach the driver.
+    """
+    amplifier = _RecordingAmplifier(strict=True)
+    worker = _worker_for(amplifier)
+
+    result = await _handler(worker).handle(
+        _raw_task(AMPLIFIER_SELECT_PREAMP_RANGE_TASK_NAME, b'{"device": "a", "preamp_range": 2.0}'),
+        capabilities=_make_capabilities(),
+    )
+
+    assert result.status == "error"
+    assert result.error_code == "UNSUPPORTED"
+    assert result.retryable is False
+    assert result.error == f"{AMPLIFIER_SELECT_PREAMP_RANGE_TASK_NAME} is unsupported: {PREAMP_RANGE_UNSUPPORTED_REASON}"
+    assert "select_feedback_resistor" in result.error
+    assert all(calls == [] for calls in _all_control_calls(amplifier))
+    assert amplifier.read_calls == 0
+
+
 @pytest.mark.asyncio
 async def test_feedback_resistor_read_back_failure_still_reports_the_write() -> None:
     """A failed read-back after a successful write is reported as success.
@@ -770,7 +964,7 @@ async def test_feedback_resistor_read_back_failure_still_reports_the_write() -> 
     worker = _worker_for(amplifier)
 
     result = await _handler(worker).handle(
-        _make_task(AMPLIFIER_SET_FEEDBACK_RESISTOR_TASK_NAME, {"device": DEVICE, "resistance_ohm": 1_000_000.0}),
+        _make_task(AMPLIFIER_SET_FEEDBACK_RESISTOR_TASK_NAME, {"device": DEVICE, "feedback_resistor_ohm": 1_000_000.0}),
         capabilities=_make_capabilities(),
     )
 
@@ -778,7 +972,7 @@ async def test_feedback_resistor_read_back_failure_still_reports_the_write() -> 
     assert result.error_code == ""
     assert result.retryable is False
     response = msgspec.json.decode(result.payload, type=AmplifierCommandResponse)
-    assert response.applied == {"resistance_ohm": 1_000_000.0}
+    assert response.applied == {"feedback_resistor_ohm": 1_000_000.0}
     assert response.state is None
     assert response.readback_error is not None
     assert "OSError" in response.readback_error
@@ -800,7 +994,7 @@ async def test_gateway_target_failed_read_back_still_reports_the_write() -> None
     worker.connected[DEVICE] = True
 
     result = await _handler(worker).handle(
-        _make_task(AMPLIFIER_SET_FEEDBACK_RESISTOR_TASK_NAME, {"device": DEVICE, "resistance_ohm": 1_000_000.0}),
+        _make_task(AMPLIFIER_SET_FEEDBACK_RESISTOR_TASK_NAME, {"device": DEVICE, "feedback_resistor_ohm": 1_000_000.0}),
         capabilities=_make_capabilities(),
     )
 
@@ -808,7 +1002,7 @@ async def test_gateway_target_failed_read_back_still_reports_the_write() -> None
     assert result.error_code == ""
     assert result.retryable is False
     response = msgspec.json.decode(result.payload, type=AmplifierCommandResponse)
-    assert response.applied == {"resistance_ohm": 1_000_000.0}
+    assert response.applied == {"feedback_resistor_ohm": 1_000_000.0}
     assert response.state is None
     assert response.readback_error is not None
     assert "GatewayTargetFailed" in response.readback_error
@@ -830,7 +1024,7 @@ async def test_relay_transition_read_back_still_reports_the_write() -> None:
     worker.connected[DEVICE] = True
 
     result = await _handler(worker).handle(
-        _make_task(AMPLIFIER_SET_FEEDBACK_RESISTOR_TASK_NAME, {"device": DEVICE, "resistance_ohm": 1_000_000.0}),
+        _make_task(AMPLIFIER_SET_FEEDBACK_RESISTOR_TASK_NAME, {"device": DEVICE, "feedback_resistor_ohm": 1_000_000.0}),
         capabilities=_make_capabilities(),
     )
 
@@ -838,7 +1032,7 @@ async def test_relay_transition_read_back_still_reports_the_write() -> None:
     assert result.error_code == ""
     assert result.retryable is False
     response = msgspec.json.decode(result.payload, type=AmplifierCommandResponse)
-    assert response.applied == {"resistance_ohm": 1_000_000.0}
+    assert response.applied == {"feedback_resistor_ohm": 1_000_000.0}
     assert response.state is None
     assert response.readback_error is not None
     assert "RelayTransitionError" in response.readback_error
@@ -887,7 +1081,7 @@ async def test_bus_failure_taxonomy(stage, exc, retryable, unhealthy) -> None:
     worker = _worker_for(amplifier)
     worker.connected[DEVICE] = True
     task, payload = (
-        (AMPLIFIER_SET_DC_BIAS_TASK_NAME, {"device": DEVICE, "enabled": True})
+        (AMPLIFIER_SET_DC_BIAS_TASK_NAME, {"device": DEVICE, "dc_bias_enabled": True})
         if stage == "write"
         else (AMPLIFIER_READ_TASK_NAME, {"device": DEVICE})
     )
@@ -933,7 +1127,7 @@ async def test_wrapped_write_failure_is_classified_by_cause(cause, retryable, un
     worker.connected[DEVICE] = True
 
     result = await _handler(worker).handle(
-        _make_task(AMPLIFIER_SET_DC_BIAS_TASK_NAME, {"device": DEVICE, "enabled": True}),
+        _make_task(AMPLIFIER_SET_DC_BIAS_TASK_NAME, {"device": DEVICE, "dc_bias_enabled": True}),
         capabilities=_make_capabilities(),
     )
 
@@ -986,20 +1180,20 @@ async def test_read_wrapped_failure_keeps_the_read_verdict(cause, unhealthy) -> 
 _GATE_CASES = [
     (
         AMPLIFIER_SET_FEEDBACK_RESISTOR_TASK_NAME,
-        {"device": DEVICE, "resistance_ohm": 1_000_000.0},
+        {"device": DEVICE, "feedback_resistor_ohm": 1_000_000.0},
         "can_select_preamp",
         "select_feedback_resistor_calls",
     ),
-    (AMPLIFIER_SET_BOOST_GAIN_TASK_NAME, {"device": DEVICE, "gain": 10.0}, "can_set_boost", "set_boost_gain_calls"),
+    (AMPLIFIER_SET_BOOST_GAIN_TASK_NAME, {"device": DEVICE, "boost_gain": 10.0}, "can_set_boost", "set_boost_gain_calls"),
     (
         AMPLIFIER_SET_DC_BIAS_TASK_NAME,
-        {"device": DEVICE, "enabled": True},
+        {"device": DEVICE, "dc_bias_enabled": True},
         "capabilities.dc_bias.enabled.write",
         "set_dc_bias_calls",
     ),
     (
         AMPLIFIER_SET_DC_BIAS_LEVEL_TASK_NAME,
-        {"device": DEVICE, "level": 0.5},
+        {"device": DEVICE, "dc_bias_level": 0.5},
         "capabilities.dc_bias.level.write",
         "set_dc_bias_level_calls",
     ),
@@ -1011,19 +1205,19 @@ _GATE_CASES = [
     ),
     (
         AMPLIFIER_SET_FILTER_TASK_NAME,
-        {"device": DEVICE, "filter_type": "low_pass", "enabled": True},
+        {"device": DEVICE, "filter_type": "low_pass", "filter_enabled": True},
         "capabilities.filters.enabled.write",
         "set_filter_calls",
     ),
     (
         AMPLIFIER_SET_INPUT_COMPENSATION_TASK_NAME,
-        {"device": DEVICE, "enabled": True},
+        {"device": DEVICE, "input_compensation_enabled": True},
         "capabilities.input_compensation.enabled.write",
         "set_input_compensation_calls",
     ),
     (
         AMPLIFIER_SET_INPUT_COMPENSATION_LEVEL_TASK_NAME,
-        {"device": DEVICE, "level": 0.25},
+        {"device": DEVICE, "input_compensation_level": 0.25},
         "capabilities.input_compensation.level.write",
         "set_input_compensation_level_calls",
     ),
@@ -1055,7 +1249,7 @@ async def test_dc_bias_toggle_requires_enabled_write_not_level_write() -> None:
     assert amplifier.can_set_dc_bias is True, "the OR property alone would let the stub be dispatched"
 
     result = await _handler(worker).handle(
-        _make_task(AMPLIFIER_SET_DC_BIAS_TASK_NAME, {"device": DEVICE, "enabled": True}),
+        _make_task(AMPLIFIER_SET_DC_BIAS_TASK_NAME, {"device": DEVICE, "dc_bias_enabled": True}),
         capabilities=_make_capabilities(),
     )
 
@@ -1074,7 +1268,7 @@ async def test_input_compensation_toggle_requires_enabled_write_not_level_write(
     assert amplifier.can_set_input_compensation is True, "the OR property alone would let the stub be dispatched"
 
     result = await _handler(worker).handle(
-        _make_task(AMPLIFIER_SET_INPUT_COMPENSATION_TASK_NAME, {"device": DEVICE, "enabled": True}),
+        _make_task(AMPLIFIER_SET_INPUT_COMPENSATION_TASK_NAME, {"device": DEVICE, "input_compensation_enabled": True}),
         capabilities=_make_capabilities(),
     )
 
@@ -1092,7 +1286,7 @@ async def test_filter_toggle_needs_only_enabled_write() -> None:
     worker = _worker_for(amplifier)
 
     result = await _handler(worker).handle(
-        _make_task(AMPLIFIER_SET_FILTER_TASK_NAME, {"device": DEVICE, "filter_type": "low_pass", "enabled": True}),
+        _make_task(AMPLIFIER_SET_FILTER_TASK_NAME, {"device": DEVICE, "filter_type": "low_pass", "filter_enabled": True}),
         capabilities=_make_capabilities(),
     )
 
@@ -1111,7 +1305,7 @@ async def test_filter_with_cutoffs_requires_cutoff_write() -> None:
     result = await _handler(worker).handle(
         _make_task(
             AMPLIFIER_SET_FILTER_TASK_NAME,
-            {"device": DEVICE, "filter_type": "low_pass", "enabled": True, "low_cutoff_hz": 10.0},
+            {"device": DEVICE, "filter_type": "low_pass", "filter_enabled": True, "filter_low_cutoff_hz": 10.0},
         ),
         capabilities=_make_capabilities(),
     )
@@ -1130,7 +1324,7 @@ async def test_feedback_resistor_out_of_domain_is_rejected() -> None:
     worker = _worker_for(amplifier)
 
     result = await _handler(worker).handle(
-        _make_task(AMPLIFIER_SET_FEEDBACK_RESISTOR_TASK_NAME, {"device": DEVICE, "resistance_ohm": 500.0}),
+        _make_task(AMPLIFIER_SET_FEEDBACK_RESISTOR_TASK_NAME, {"device": DEVICE, "feedback_resistor_ohm": 500.0}),
         capabilities=_make_capabilities(),
     )
 
@@ -1151,7 +1345,7 @@ async def test_boost_gain_out_of_domain_is_rejected() -> None:
     worker = _worker_for(amplifier)
 
     result = await _handler(worker).handle(
-        _make_task(AMPLIFIER_SET_BOOST_GAIN_TASK_NAME, {"device": DEVICE, "gain": 2.0}),
+        _make_task(AMPLIFIER_SET_BOOST_GAIN_TASK_NAME, {"device": DEVICE, "boost_gain": 2.0}),
         capabilities=_make_capabilities(),
     )
 
@@ -1202,8 +1396,8 @@ async def test_filter_type_outside_the_board_domain_is_rejected() -> None:
 
 
 _TYPE_ERROR_CASES = [
-    (AMPLIFIER_SET_DC_BIAS_TASK_NAME, {"device": DEVICE, "enabled": "yes"}),
-    (AMPLIFIER_SET_BOOST_GAIN_TASK_NAME, {"device": DEVICE, "gain": "high"}),
+    (AMPLIFIER_SET_DC_BIAS_TASK_NAME, {"device": DEVICE, "dc_bias_enabled": "yes"}),
+    (AMPLIFIER_SET_BOOST_GAIN_TASK_NAME, {"device": DEVICE, "boost_gain": "high"}),
     (AMPLIFIER_READ_TASK_NAME, {"device": 5}),
 ]
 
@@ -1250,14 +1444,14 @@ async def test_malformed_payload_is_invalid_payload(task, raw) -> None:
 
 
 _MISSING_FIELD_CASES = [
-    (AMPLIFIER_SET_FEEDBACK_RESISTOR_TASK_NAME, "resistance_ohm"),
-    (AMPLIFIER_SET_BOOST_GAIN_TASK_NAME, "gain"),
-    (AMPLIFIER_SET_DC_BIAS_TASK_NAME, "enabled"),
-    (AMPLIFIER_SET_DC_BIAS_LEVEL_TASK_NAME, "level"),
+    (AMPLIFIER_SET_FEEDBACK_RESISTOR_TASK_NAME, "feedback_resistor_ohm"),
+    (AMPLIFIER_SET_BOOST_GAIN_TASK_NAME, "boost_gain"),
+    (AMPLIFIER_SET_DC_BIAS_TASK_NAME, "dc_bias_enabled"),
+    (AMPLIFIER_SET_DC_BIAS_LEVEL_TASK_NAME, "dc_bias_level"),
     (AMPLIFIER_SET_BANDWIDTH_TASK_NAME, "bandwidth_hz"),
     (AMPLIFIER_SET_FILTER_TASK_NAME, "filter_type"),
-    (AMPLIFIER_SET_INPUT_COMPENSATION_TASK_NAME, "enabled"),
-    (AMPLIFIER_SET_INPUT_COMPENSATION_LEVEL_TASK_NAME, "level"),
+    (AMPLIFIER_SET_INPUT_COMPENSATION_TASK_NAME, "input_compensation_enabled"),
+    (AMPLIFIER_SET_INPUT_COMPENSATION_LEVEL_TASK_NAME, "input_compensation_level"),
     (AMPLIFIER_SET_INVERTED_TASK_NAME, "inverted"),
 ]
 
@@ -1306,7 +1500,7 @@ async def test_write_exception_mapping(exc, error_code, retryable, unhealthy) ->
     worker.connected[DEVICE] = True
 
     result = await _handler(worker).handle(
-        _make_task(AMPLIFIER_SET_DC_BIAS_TASK_NAME, {"device": DEVICE, "enabled": True}),
+        _make_task(AMPLIFIER_SET_DC_BIAS_TASK_NAME, {"device": DEVICE, "dc_bias_enabled": True}),
         capabilities=_make_capabilities(),
     )
 

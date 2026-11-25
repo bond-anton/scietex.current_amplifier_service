@@ -187,7 +187,7 @@ async def test_label_is_a_display_extra_not_the_identity(tmp_path) -> None:
 
 @pytest.mark.asyncio
 async def test_device_transport_matches_the_list_payload(tmp_path) -> None:
-    """Every telemetry entry carries the service-wide transport as ``amplifier:list`` does."""
+    """Every telemetry entry carries the service-wide transport as ``current_amplifier:list`` does."""
     serial_worker = _make_worker(tmp_path / "serial")
     await serial_worker._build_amplifiers(make_settings({"wired": make_device_settings(address=2)}))
     assert build_telemetry(serial_worker).devices["wired"].transport == "rs485"
