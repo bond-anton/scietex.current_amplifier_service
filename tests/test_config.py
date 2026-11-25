@@ -9,9 +9,8 @@ from scietex.current_amplifier_service.config import (
     CURRENT_AMPLIFIER_CONFIG_FILE,
     CURRENT_AMPLIFIER_CONFIG_SUBDIR,
     CURRENT_AMPLIFIER_SETTINGS_DEFAULTS,
-    AmplifierSerialSettings,
-    AmplifierSettings,
-    AmplifierTcpSettings,
+    AmplifierDeviceSettings,
+    AmplifierTransportSettings,
     CurrentAmplifierServiceSettings,
     read_current_amplifier_config,
     transport_for_driver,
@@ -23,172 +22,315 @@ def _config_path(conf_dir: Path) -> Path:
     return conf_dir / CURRENT_AMPLIFIER_CONFIG_SUBDIR / CURRENT_AMPLIFIER_CONFIG_FILE
 
 
-def _board(**overrides: object) -> dict[str, object]:
-    """A minimal valid board payload with optional top-level overrides."""
-    payload: dict[str, object] = {"label": "board", "serial": {"port": "/dev/ttyUSB0"}}
+def _transport(**overrides: object) -> dict[str, object]:
+    """A minimal valid RS485 transport payload with optional overrides."""
+    payload: dict[str, object] = {"port": "/dev/ttyUSB0"}
     payload.update(overrides)
     return payload
 
 
-def test_yaml_roundtrip_preserves_amplifier_list() -> None:
-    """Board entries survive a YAML round-trip preserving every field."""
+def _device(**overrides: object) -> dict[str, object]:
+    """A minimal valid device payload with optional overrides."""
+    payload: dict[str, object] = {"address": 2}
+    payload.update(overrides)
+    return payload
+
+
+def _service(*devices: dict[str, object], **overrides: object) -> dict[str, object]:
+    """A service payload whose devices map is keyed by position."""
+    payload: dict[str, object] = {
+        "transport": _transport(),
+        "devices": {f"dev{index}": device for index, device in enumerate(devices)},
+    }
+    payload.update(overrides)
+    return payload
+
+
+# -- defaults ---------------------------------------------------------------
+
+
+def test_transport_defaults_mirror_the_plugin() -> None:
+    """Transport defaults are field-for-field the API plugin's."""
+    transport = AmplifierTransportSettings(port="/dev/ttyUSB0")
+
+    assert transport.kind == "rs485"
+    assert transport.port == "/dev/ttyUSB0"
+    assert transport.baudrate == 9600
+    assert transport.bytesize == 8
+    assert transport.parity == "N"
+    assert transport.stopbits == 1.0
+    assert transport.timeout == 1.0
+    assert transport.write_timeout is None
+    assert transport.inter_byte_timeout is None
+    assert transport.framer == "RTU"
+    assert transport.host is None
+    assert transport.tcp_port == 502
+    assert transport.tcp_timeout == 30.0
+    assert transport.tcp_retries == 0
+
+
+def test_device_defaults_mirror_the_plugin() -> None:
+    """A device defaults to the plugin's driver, address and poll plan."""
+    device = AmplifierDeviceSettings()
+
+    assert device.driver == "ebic_modbus_v1"
+    assert device.address == 1
+    assert device.label is None
+    assert device.poll is True
+    assert device.poll_interval == 1.0
+    assert device.relay_settle_s is None
+
+
+def test_service_defaults_mirror_the_plugin() -> None:
+    """The service defaults to no devices, polling enabled and the plugin counters."""
+    settings = CurrentAmplifierServiceSettings(transport=AmplifierTransportSettings(port="/dev/ttyUSB0"))
+
+    assert settings.name is None
+    assert settings.devices == {}
+    assert settings.poll_enabled is True
+    assert settings.failure_threshold == 3
+    assert settings.stream_maxlen == 10000
+
+
+def test_defaults_constant_is_l0_base() -> None:
+    """The exported L0 base is a concrete default struct instance."""
+    assert isinstance(CURRENT_AMPLIFIER_SETTINGS_DEFAULTS, CurrentAmplifierServiceSettings)
+    assert CURRENT_AMPLIFIER_SETTINGS_DEFAULTS.devices == {}
+    assert CURRENT_AMPLIFIER_SETTINGS_DEFAULTS.transport.kind == "rs485"
+    assert CURRENT_AMPLIFIER_SETTINGS_DEFAULTS.transport.port == "/dev/ttyUSB0"
+
+
+def test_defaults_roundtrip_through_msgspec() -> None:
+    """The generated default validates and decodes back to itself.
+
+    The framework generates ``current_amplifier.yml`` from the defaults, so the
+    encoded form must be a valid payload for the settings struct it came from.
+    """
+    builtins = msgspec.to_builtins(CURRENT_AMPLIFIER_SETTINGS_DEFAULTS)
+
+    assert msgspec.convert(builtins, type=CurrentAmplifierServiceSettings) == CURRENT_AMPLIFIER_SETTINGS_DEFAULTS
+    assert (
+        msgspec.yaml.decode(msgspec.yaml.encode(CURRENT_AMPLIFIER_SETTINGS_DEFAULTS), type=CurrentAmplifierServiceSettings)
+        == CURRENT_AMPLIFIER_SETTINGS_DEFAULTS
+    )
+
+
+# -- decoding ---------------------------------------------------------------
+
+
+def test_yaml_roundtrip_preserves_the_device_map() -> None:
+    """Transport and device entries survive a YAML round-trip preserving every field."""
     settings = CurrentAmplifierServiceSettings(
-        amplifiers=[
-            AmplifierSettings(
-                label="photodiode_a",
-                serial=AmplifierSerialSettings(port="/dev/ttyUSB0", baudrate=19200, parity="E", stopbits=1.5),
+        transport=AmplifierTransportSettings(
+            port="/dev/ttyUSB0", baudrate=19200, parity="E", stopbits=1.5, write_timeout=0.5, inter_byte_timeout=0.01
+        ),
+        devices={
+            "photodiode_a": AmplifierDeviceSettings(
                 address=5,
+                label="Photodiode A",
+                poll=False,
                 poll_interval=0.5,
                 relay_settle_s=0.008,
             )
-        ],
+        },
         failure_threshold=2,
         stream_maxlen=500,
     )
 
     decoded = msgspec.yaml.decode(msgspec.yaml.encode(settings), type=CurrentAmplifierServiceSettings)
 
-    board = decoded.amplifiers[0]
-    assert board.label == "photodiode_a"
-    assert board.driver == "ebic_modbus_v1"
-    assert board.address == 5
-    assert board.poll_interval == 0.5
-    assert board.relay_settle_s == 0.008
-    assert board.serial.port == "/dev/ttyUSB0"
-    assert board.serial.baudrate == 19200
-    assert board.serial.parity == "E"
-    assert board.serial.stopbits == 1.5
+    assert decoded == settings
+    assert decoded.transport.baudrate == 19200
+    assert decoded.transport.parity == "E"
+    assert decoded.transport.stopbits == 1.5
+    assert decoded.transport.write_timeout == 0.5
+    assert decoded.transport.inter_byte_timeout == 0.01
+    device = decoded.devices["photodiode_a"]
+    assert device.address == 5
+    assert device.label == "Photodiode A"
+    assert device.poll is False
+    assert device.poll_interval == 0.5
+    assert device.relay_settle_s == 0.008
     assert decoded.failure_threshold == 2
     assert decoded.stream_maxlen == 500
 
 
-def test_explicit_yaml_parses_two_boards() -> None:
-    """Two boards on different ports and addresses parse with their own values."""
+def test_explicit_yaml_parses_transport_and_two_devices() -> None:
+    """An explicit YAML payload parses the shared transport and keyed devices."""
     yaml_text = """
-amplifiers:
-  - label: photodiode_a
+transport:
+  kind: rs485
+  port: /dev/ttyUSB0
+  baudrate: 19200
+  bytesize: 8
+  parity: N
+  stopbits: 1
+  timeout: 1.0
+  framer: RTU
+devices:
+  photodiode_a:
     driver: ebic_modbus_v1
     address: 2
     poll_interval: 1.0
-    serial:
-      port: /dev/ttyUSB0
-      baudrate: 19200
-      bytesize: 8
-      parity: N
-      stopbits: 1
-      timeout: 1.0
-      framer: RTU
-  - label: ion_collector_b
+  ion_collector_b:
     address: 3
     poll_interval: 2.0
-    serial:
-      port: /dev/ttyUSB1
+    poll: false
 failure_threshold: 2
 stream_maxlen: 500
 """
 
     settings = msgspec.yaml.decode(yaml_text, type=CurrentAmplifierServiceSettings)
 
-    first, second = settings.amplifiers
-    assert first.label == "photodiode_a"
+    assert settings.transport.baudrate == 19200
+    assert settings.transport.framer == "RTU"
+    assert list(settings.devices) == ["photodiode_a", "ion_collector_b"]
+    first = settings.devices["photodiode_a"]
     assert first.address == 2
-    assert first.serial.port == "/dev/ttyUSB0"
-    assert first.serial.framer == "RTU"
-    assert second.label == "ion_collector_b"
+    assert first.poll_interval == 1.0
+    second = settings.devices["ion_collector_b"]
     assert second.address == 3
     assert second.poll_interval == 2.0
-    assert second.serial.port == "/dev/ttyUSB1"
-    assert second.serial.baudrate == 19200
+    assert second.poll is False
     assert second.relay_settle_s is None
     assert settings.failure_threshold == 2
     assert settings.stream_maxlen == 500
 
 
-def test_defaults_constant_is_l0_base() -> None:
-    """The exported L0 base is a concrete default struct instance."""
-    assert isinstance(CURRENT_AMPLIFIER_SETTINGS_DEFAULTS, CurrentAmplifierServiceSettings)
-    assert CURRENT_AMPLIFIER_SETTINGS_DEFAULTS == CurrentAmplifierServiceSettings()
+def test_tcp_transport_parses_with_gateway_defaults() -> None:
+    """``kind: tcp`` plus a host parses; the gateway port and timeout default."""
+    transport = msgspec.convert({"kind": "tcp", "host": "127.0.0.1"}, AmplifierTransportSettings)
+
+    assert transport.kind == "tcp"
+    assert transport.port is None
+    assert transport.host == "127.0.0.1"
+    assert transport.tcp_port == 502
+    assert transport.tcp_timeout == 30.0
+    assert transport.tcp_retries == 0
 
 
-def test_serial_defaults() -> None:
-    """Serial settings default to the EBIC firmware 19200 8N1 RTU line."""
-    serial = AmplifierSerialSettings(port="/dev/ttyUSB0")
-    assert serial.baudrate == 19200
-    assert serial.bytesize == 8
-    assert serial.parity == "N"
-    assert serial.stopbits == 1
-    assert serial.timeout == 1.0
-    assert serial.framer == "RTU"
+def test_name_is_accepted_and_ignored() -> None:
+    """The plugin carries a ``name``; the framework owns the instance name."""
+    settings = msgspec.convert(_service(name="main"), CurrentAmplifierServiceSettings)
+
+    assert settings.name == "main"
 
 
-def test_amplifier_defaults() -> None:
-    """A board defaults to the EBIC driver, address 2, a 1 s poll and no settle override."""
-    board = AmplifierSettings(label="photodiode_a", serial=AmplifierSerialSettings(port="/dev/ttyUSB0"))
-    assert board.driver == "ebic_modbus_v1"
-    assert board.address == 2
-    assert board.poll_interval == 1.0
-    assert board.relay_settle_s is None
-
-
-def test_service_defaults() -> None:
-    """The service defaults to no boards, a 3-failure threshold and 10000 entries."""
-    settings = CurrentAmplifierServiceSettings()
-    assert settings.amplifiers == []
-    assert settings.failure_threshold == 3
-    assert settings.stream_maxlen == 10000
-
-
-def test_unknown_field_rejected() -> None:
-    """``forbid_unknown_fields`` rejects a typo instead of silently ignoring it."""
+def test_unknown_fields_are_rejected() -> None:
+    """``forbid_unknown_fields`` rejects a typo at every level."""
     with pytest.raises(msgspec.ValidationError, match="bogus"):
-        msgspec.convert(
-            {"amplifiers": [{"label": "a", "serial": {"port": "/dev/ttyUSB0"}, "bogus": 1}]},
-            CurrentAmplifierServiceSettings,
-        )
-
-
-def test_unknown_nested_field_rejected() -> None:
-    """A typo inside the ``serial`` block is rejected, not just at board level."""
+        msgspec.convert(_service(bogus=1), CurrentAmplifierServiceSettings)
     with pytest.raises(msgspec.ValidationError, match="bogus"):
-        msgspec.convert(_board(serial={"port": "/dev/ttyUSB0", "bogus": 1}), AmplifierSettings)
+        msgspec.convert(_transport(bogus=1), AmplifierTransportSettings)
+    with pytest.raises(msgspec.ValidationError, match="bogus"):
+        msgspec.convert(_device(bogus=1), AmplifierDeviceSettings)
 
 
-def test_invalid_framer_rejected() -> None:
-    """An unsupported Modbus framer fails at config-load time, not registry time."""
-    with pytest.raises(msgspec.ValidationError, match="serial.framer"):
-        msgspec.convert(_board(serial={"port": "/dev/ttyUSB0", "framer": "TCP"}), AmplifierSettings)
+# -- transport validation ---------------------------------------------------
 
 
 @pytest.mark.parametrize(
     ("overrides", "match"),
     [
-        ({"address": 0}, "address"),
-        ({"address": 248}, "address"),
-        ({"poll_interval": 0}, "poll_interval"),
-        ({"poll_interval": -1.0}, "poll_interval"),
-        ({"relay_settle_s": -0.001}, "relay_settle_s"),
+        ({"kind": "udp"}, "transport.kind"),
+        ({"baudrate": 0}, "transport.baudrate"),
+        ({"bytesize": 9}, "transport.bytesize"),
+        ({"parity": "X"}, "transport.parity"),
+        ({"stopbits": 3}, "transport.stopbits"),
+        ({"timeout": -1.0}, "transport.timeout"),
+        ({"write_timeout": -1.0}, "transport.write_timeout"),
+        ({"inter_byte_timeout": -1.0}, "transport.inter_byte_timeout"),
+        ({"framer": "TCP"}, "transport.framer"),
     ],
 )
-def test_invalid_amplifier_settings_rejected(overrides: dict[str, object], match: str) -> None:
-    """Board address, poll interval and relay settle time are range-checked."""
+def test_invalid_transport_settings_are_rejected(overrides: dict[str, object], match: str) -> None:
+    """Serial field domains are checked before the HAL config is ever built."""
     with pytest.raises(msgspec.ValidationError, match=match):
-        msgspec.convert(_board(**overrides), AmplifierSettings)
+        msgspec.convert(_transport(**overrides), AmplifierTransportSettings)
 
 
 @pytest.mark.parametrize(
-    ("serial", "match"),
+    ("payload", "match"),
     [
-        ({"baudrate": 0}, "baudrate"),
-        ({"bytesize": 9}, "bytesize"),
-        ({"parity": "X"}, "parity"),
-        ({"stopbits": 3}, "stopbits"),
-        ({"timeout": -1.0}, "timeout"),
+        ({}, "transport 'rs485' requires 'port'"),
+        ({"port": ""}, "transport 'rs485' requires 'port'"),
+        ({"port": "/dev/ttyUSB0", "host": "127.0.0.1"}, "transport 'rs485' must not set 'host'"),
+        ({"kind": "tcp"}, "transport 'tcp' requires 'host'"),
+        ({"kind": "tcp", "host": ""}, "transport 'tcp' requires 'host'"),
+        ({"kind": "tcp", "host": "127.0.0.1", "port": "/dev/ttyUSB0"}, "transport 'tcp' must not set 'port'"),
     ],
 )
-def test_invalid_serial_settings_rejected(serial: dict[str, object], match: str) -> None:
-    """Serial field domains are checked before the HAL config is ever built."""
+def test_transport_kind_and_endpoint_must_agree(payload: dict[str, object], match: str) -> None:
+    """Each kind requires its own endpoint field and forbids the other's."""
     with pytest.raises(msgspec.ValidationError, match=match):
-        msgspec.convert(_board(serial={"port": "/dev/ttyUSB0", **serial}), AmplifierSettings)
+        msgspec.convert(payload, AmplifierTransportSettings)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "match"),
+    [
+        ({"tcp_port": 0}, "transport.tcp_port"),
+        ({"tcp_port": 70000}, "transport.tcp_port"),
+        ({"tcp_timeout": 0}, "transport.tcp_timeout"),
+        ({"tcp_timeout": -1.0}, "transport.tcp_timeout"),
+        ({"tcp_retries": -1}, "transport.tcp_retries"),
+    ],
+)
+def test_invalid_tcp_settings_are_rejected(overrides: dict[str, object], match: str) -> None:
+    """TCP endpoint domains are checked before the HAL client is ever built."""
+    with pytest.raises(msgspec.ValidationError, match=match):
+        msgspec.convert({"kind": "tcp", "host": "127.0.0.1", **overrides}, AmplifierTransportSettings)
+
+
+def test_stopbits_accepts_the_full_domain() -> None:
+    """One, 1.5 and two stop bits are all valid."""
+    for stopbits in (1, 1.5, 2):
+        assert AmplifierTransportSettings(port="/dev/ttyUSB0", stopbits=stopbits).stopbits == stopbits
+
+
+# -- device and service validation ------------------------------------------
+
+
+@pytest.mark.parametrize("address", [0, 248, -1])
+def test_device_address_is_range_checked(address: int) -> None:
+    """The Modbus address must be within 1..247."""
+    with pytest.raises(msgspec.ValidationError, match="address must be within 1..247"):
+        msgspec.convert(_service(_device(address=address)), CurrentAmplifierServiceSettings)
+
+
+@pytest.mark.parametrize("poll_interval", [0, -1.0])
+def test_device_poll_interval_must_be_positive(poll_interval: float) -> None:
+    """A zero or negative poll interval would spin the loop."""
+    with pytest.raises(msgspec.ValidationError, match="poll_interval must be positive"):
+        msgspec.convert(_service(_device(poll_interval=poll_interval)), CurrentAmplifierServiceSettings)
+
+
+def test_device_relay_settle_must_be_non_negative() -> None:
+    """A negative relay settle window is meaningless."""
+    with pytest.raises(msgspec.ValidationError, match="relay_settle_s must be non-negative"):
+        msgspec.convert(_service(_device(relay_settle_s=-0.001)), CurrentAmplifierServiceSettings)
+
+
+def test_empty_device_id_is_rejected() -> None:
+    """The device id is a stream-key segment, so it cannot be empty."""
+    payload = _service()
+    payload["devices"] = {"": _device()}
+
+    with pytest.raises(msgspec.ValidationError, match="device id must not be empty"):
+        msgspec.convert(payload, CurrentAmplifierServiceSettings)
+
+
+def test_duplicate_address_across_devices_is_rejected() -> None:
+    """One transport cannot hold two devices on the same Modbus address."""
+    with pytest.raises(msgspec.ValidationError, match="share Modbus address 2"):
+        msgspec.convert(_service(_device(address=2), _device(address=2)), CurrentAmplifierServiceSettings)
+
+
+def test_distinct_addresses_on_one_transport_are_valid() -> None:
+    """A shared RS485 segment stays valid as long as addresses differ."""
+    settings = msgspec.convert(_service(_device(address=2), _device(address=3)), CurrentAmplifierServiceSettings)
+
+    assert [device.address for device in settings.devices.values()] == [2, 3]
 
 
 @pytest.mark.parametrize(
@@ -198,275 +340,40 @@ def test_invalid_serial_settings_rejected(serial: dict[str, object], match: str)
         ({"stream_maxlen": 0}, "stream_maxlen"),
     ],
 )
-def test_invalid_service_settings_rejected(overrides: dict[str, object], match: str) -> None:
+def test_invalid_service_counters_are_rejected(overrides: dict[str, object], match: str) -> None:
     """Service-wide counters must be positive."""
     with pytest.raises(msgspec.ValidationError, match=match):
-        msgspec.convert(overrides, CurrentAmplifierServiceSettings)
+        msgspec.convert(_service(**overrides), CurrentAmplifierServiceSettings)
 
 
 def test_direct_construction_raises_value_error() -> None:
     """Direct struct construction (registry path) raises a plain ValueError."""
-    with pytest.raises(ValueError, match="address"):
-        AmplifierSettings(label="board", serial=AmplifierSerialSettings(port="/dev/ttyUSB0"), address=300)
+    with pytest.raises(ValueError, match="address must be within 1..247"):
+        CurrentAmplifierServiceSettings(
+            transport=AmplifierTransportSettings(port="/dev/ttyUSB0"),
+            devices={"board": AmplifierDeviceSettings(address=300)},
+        )
 
 
-def _tcp_board(**overrides: object) -> dict[str, object]:
-    """A minimal valid Modbus/TCP board payload with optional overrides."""
-    payload: dict[str, object] = {
-        "label": "preamp_1",
-        "driver": "ebic_modbus_tcp_v1_preamp",
-        "transport": "tcp",
-        "tcp": {"host": "127.0.0.1"},
-    }
-    payload.update(overrides)
-    return payload
-
-
-def test_legacy_board_without_transport_stays_serial() -> None:
-    """A board entry written before the TCP transport existed parses unchanged."""
-    yaml_text = """
-amplifiers:
-  - label: photodiode_a
-    driver: ebic_modbus_v1
-    address: 2
-    serial:
-      port: /dev/ttyUSB0
-"""
-
-    board = msgspec.yaml.decode(yaml_text, type=CurrentAmplifierServiceSettings).amplifiers[0]
-
-    assert board.transport == "rs485"
-    assert board.tcp is None
-    assert board.serial is not None
-    assert board.serial.port == "/dev/ttyUSB0"
-
-
-def test_tcp_board_parses_with_gateway_defaults() -> None:
-    """``transport: tcp`` plus a ``tcp`` block parses; the serial block stays unset."""
-    board = msgspec.convert(
-        _tcp_board(label="preamp_1", address=3, poll_interval=1.0, relay_settle_s=0.008),
-        AmplifierSettings,
-    )
-
-    assert board.transport == "tcp"
-    assert board.serial is None
-    assert board.tcp is not None
-    assert board.tcp.host == "127.0.0.1"
-    assert board.tcp.port == 502
-    assert board.tcp.timeout == 30.0
-    assert board.tcp.retries == 0
-    assert board.address == 3
-
-
-def test_tcp_explicit_timeout_overrides_default() -> None:
-    """An explicit ``tcp.timeout`` replaces the 30.0 s gateway default."""
-    board = msgspec.convert(_tcp_board(tcp={"host": "127.0.0.1", "timeout": 45.0}), AmplifierSettings)
-
-    assert board.tcp.timeout == 45.0
-
-
-def test_tcp_block_roundtrips_through_yaml() -> None:
-    """The TCP endpoint survives a YAML round-trip with its configured values."""
-    settings = CurrentAmplifierServiceSettings(
-        amplifiers=[
-            AmplifierSettings(
-                label="preamp_1",
-                tcp=AmplifierTcpSettings(host="gateway.local", port=1502, timeout=8.0, retries=1),
-                transport="tcp",
-                driver="ebic_modbus_tcp_v1",
-                address=5,
-            )
-        ]
-    )
-
-    decoded = msgspec.yaml.decode(msgspec.yaml.encode(settings), type=CurrentAmplifierServiceSettings)
-    board = decoded.amplifiers[0]
-
-    assert board.transport == "tcp"
-    assert board.tcp == AmplifierTcpSettings(host="gateway.local", port=1502, timeout=8.0, retries=1)
-    assert board.serial is None
+# -- driver transport map ---------------------------------------------------
 
 
 @pytest.mark.parametrize(
-    ("payload", "match"),
+    ("driver", "transport"),
     [
-        (
-            {
-                "label": "board",
-                "serial": {"port": "/dev/ttyUSB0"},
-                "tcp": {"host": "127.0.0.1"},
-            },
-            "exactly one of",
-        ),
-        ({"label": "board"}, "exactly one of"),
-        (
-            {"label": "board", "driver": "ebic_modbus_v1", "transport": "tcp", "serial": {"port": "/dev/ttyUSB0"}},
-            "requires the 'tcp' block",
-        ),
-        (
-            {"label": "board", "driver": "ebic_modbus_tcp_v1", "transport": "rs485", "tcp": {"host": "127.0.0.1"}},
-            "requires the 'serial' block",
-        ),
-        (
-            {"label": "board", "serial": {"port": "/dev/ttyUSB0"}, "transport": "udp"},
-            "transport must be one of",
-        ),
+        ("ebic_modbus_v1", "rs485"),
+        ("ebic_modbus_v1_preamp", "rs485"),
+        ("ebic_modbus_tcp_v1", "tcp"),
+        ("ebic_modbus_tcp_v1_preamp", "tcp"),
+        ("vendor_specific_v2", None),
     ],
 )
-def test_transport_and_connection_block_must_agree(payload: dict[str, object], match: str) -> None:
-    """Exactly one block is set and it must be the one the transport names."""
-    with pytest.raises(msgspec.ValidationError, match=match):
-        msgspec.convert(payload, AmplifierSettings)
+def test_transport_for_driver(driver: str, transport: str | None) -> None:
+    """Only known driver families declare a transport."""
+    assert transport_for_driver(driver) == transport
 
 
-@pytest.mark.parametrize(
-    ("driver", "transport", "block", "match"),
-    [
-        ("ebic_modbus_v1_preamp", "tcp", {"host": "127.0.0.1"}, "is a rs485 driver"),
-        ("ebic_modbus_v1", "tcp", {"host": "127.0.0.1"}, "is a rs485 driver"),
-        ("ebic_modbus_tcp_v1_preamp", "rs485", {"port": "/dev/ttyUSB0"}, "is a tcp driver"),
-        ("ebic_modbus_tcp_v1", "rs485", {"port": "/dev/ttyUSB0"}, "is a tcp driver"),
-    ],
-)
-def test_driver_family_must_match_transport(driver: str, transport: str, block: dict[str, object], match: str) -> None:
-    """A serial driver on a TCP board (and vice versa) is rejected at load time."""
-    key = "tcp" if transport == "tcp" else "serial"
-    with pytest.raises(msgspec.ValidationError, match=match):
-        msgspec.convert(
-            {"label": "board", "driver": driver, "transport": transport, key: block},
-            AmplifierSettings,
-        )
-
-
-def test_unknown_driver_family_is_not_transport_checked() -> None:
-    """A driver outside the prefix map declares no transport, so it is allowed."""
-    board = msgspec.convert(_board(driver="vendor_specific_v2"), AmplifierSettings)
-    assert board.transport == "rs485"
-    assert transport_for_driver("vendor_specific_v2") is None
-
-
-@pytest.mark.parametrize(
-    ("tcp", "match"),
-    [
-        ({"host": ""}, "tcp.host"),
-        ({"host": "127.0.0.1", "port": 0}, "tcp.port"),
-        ({"host": "127.0.0.1", "port": 70000}, "tcp.port"),
-        ({"host": "127.0.0.1", "timeout": 0}, "tcp.timeout"),
-        ({"host": "127.0.0.1", "retries": -1}, "tcp.retries"),
-    ],
-)
-def test_invalid_tcp_settings_rejected(tcp: dict[str, object], match: str) -> None:
-    """TCP endpoint domains are checked before the HAL client is ever built."""
-    with pytest.raises(msgspec.ValidationError, match=match):
-        msgspec.convert(_tcp_board(tcp=tcp), AmplifierSettings)
-
-
-def test_two_tcp_boards_may_share_one_gateway() -> None:
-    """Boards behind one gateway differ by address, so a shared endpoint is valid."""
-    settings = msgspec.convert(
-        {
-            "amplifiers": [
-                _tcp_board(label="preamp_1", address=3),
-                _tcp_board(label="preamp_2", address=4),
-            ]
-        },
-        CurrentAmplifierServiceSettings,
-    )
-
-    assert [board.address for board in settings.amplifiers] == [3, 4]
-    assert settings.amplifiers[0].tcp.host == settings.amplifiers[1].tcp.host
-
-
-def test_duplicate_tcp_endpoint_and_address_rejected() -> None:
-    """The same device behind a gateway cannot be configured twice."""
-    with pytest.raises(msgspec.ValidationError, match="share the same Modbus/TCP endpoint"):
-        msgspec.convert(
-            {
-                "amplifiers": [
-                    _tcp_board(label="preamp_1", address=3),
-                    _tcp_board(label="preamp_2", address=3),
-                ]
-            },
-            CurrentAmplifierServiceSettings,
-        )
-
-
-def test_duplicate_tcp_endpoint_ignores_host_case() -> None:
-    """DNS names are case-insensitive, so a case variant is the same gateway."""
-    with pytest.raises(msgspec.ValidationError, match="share the same Modbus/TCP endpoint"):
-        msgspec.convert(
-            {
-                "amplifiers": [
-                    _tcp_board(label="preamp_1", address=3, tcp={"host": "Gateway.Local"}),
-                    _tcp_board(label="preamp_2", address=3, tcp={"host": "gateway.local"}),
-                ]
-            },
-            CurrentAmplifierServiceSettings,
-        )
-
-
-def test_duplicate_serial_endpoint_ignores_surrounding_space() -> None:
-    """A padded device path is a typo for the same port, not a second segment."""
-    with pytest.raises(msgspec.ValidationError, match="share serial port"):
-        msgspec.convert(
-            {
-                "amplifiers": [
-                    _board(label="a", address=2, serial={"port": " /dev/ttyUSB0 "}),
-                    _board(label="b", address=2, serial={"port": "/dev/ttyUSB0"}),
-                ]
-            },
-            CurrentAmplifierServiceSettings,
-        )
-
-
-def test_distinct_tcp_ports_are_distinct_endpoints() -> None:
-    """One host on two ports is two gateways, so the same address is allowed."""
-    settings = msgspec.convert(
-        {
-            "amplifiers": [
-                _tcp_board(label="preamp_1", address=3, tcp={"host": "127.0.0.1", "port": 502}),
-                _tcp_board(label="preamp_2", address=3, tcp={"host": "127.0.0.1", "port": 1502}),
-            ]
-        },
-        CurrentAmplifierServiceSettings,
-    )
-
-    assert len(settings.amplifiers) == 2
-
-
-def test_serial_boards_on_one_port_need_distinct_addresses() -> None:
-    """A shared RS485 segment stays valid; a repeated device does not."""
-    settings = msgspec.convert(
-        {
-            "amplifiers": [
-                _board(label="a", address=2),
-                _board(label="b", address=3),
-            ]
-        },
-        CurrentAmplifierServiceSettings,
-    )
-    assert len(settings.amplifiers) == 2
-
-    with pytest.raises(msgspec.ValidationError, match="share serial port"):
-        msgspec.convert(
-            {
-                "amplifiers": [
-                    _board(label="a", address=2),
-                    _board(label="b", address=2),
-                ]
-            },
-            CurrentAmplifierServiceSettings,
-        )
-
-
-def test_serial_and_tcp_boards_are_tracked_separately() -> None:
-    """A TCP board does not collide with a serial board on the same address."""
-    settings = msgspec.convert(
-        {"amplifiers": [_board(label="a", address=2), _tcp_board(label="b", address=2)]},
-        CurrentAmplifierServiceSettings,
-    )
-
-    assert [board.transport for board in settings.amplifiers] == ["rs485", "tcp"]
+# -- loader -----------------------------------------------------------------
 
 
 def test_loader_creates_default_file(tmp_path: Path) -> None:
@@ -474,18 +381,23 @@ def test_loader_creates_default_file(tmp_path: Path) -> None:
     patch = read_current_amplifier_config(tmp_path)
 
     assert _config_path(tmp_path).exists()
-    assert patch == msgspec.to_builtins(CurrentAmplifierServiceSettings())
+    assert patch == msgspec.to_builtins(CURRENT_AMPLIFIER_SETTINGS_DEFAULTS)
+    created = msgspec.yaml.decode(_config_path(tmp_path).read_bytes(), type=CurrentAmplifierServiceSettings)
+    assert created == CURRENT_AMPLIFIER_SETTINGS_DEFAULTS
 
 
 def test_loader_reads_existing_file(tmp_path: Path) -> None:
     """An existing file is parsed and returned as a raw mapping."""
     path = _config_path(tmp_path)
     path.parent.mkdir(parents=True)
-    path.write_text("amplifiers:\n  - label: photodiode_a\n    serial:\n      port: /dev/ttyUSB0\n")
+    path.write_text("transport:\n  port: /dev/ttyUSB1\ndevices:\n  photodiode_a:\n    address: 2\n")
 
     patch = read_current_amplifier_config(tmp_path)
 
-    assert patch["amplifiers"] == [{"label": "photodiode_a", "serial": {"port": "/dev/ttyUSB0"}}]
+    assert patch == {
+        "transport": {"port": "/dev/ttyUSB1"},
+        "devices": {"photodiode_a": {"address": 2}},
+    }
 
 
 def test_loader_missing_file_without_create_raises(tmp_path: Path) -> None:

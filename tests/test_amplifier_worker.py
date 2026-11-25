@@ -13,9 +13,10 @@ import pytest
 from _helpers import (
     _FakeAmplifier,
     _FakeTcpAmplifier,
-    make_amplifier_settings,
+    make_device_settings,
+    make_serial_transport,
     make_settings,
-    make_tcp_amplifier_settings,
+    make_tcp_transport,
     register_fake_driver,
 )
 from scietex.hal.current_amplifier.base.capabilities import FilterType
@@ -27,7 +28,6 @@ from scietex.current_amplifier_service.amplifier_worker import AmplifierStats, C
 from scietex.current_amplifier_service.config import (
     CURRENT_AMPLIFIER_CONFIG_FILE,
     CURRENT_AMPLIFIER_CONFIG_SUBDIR,
-    AmplifierSerialSettings,
     CurrentAmplifierServiceSettings,
 )
 
@@ -88,57 +88,50 @@ async def _wait_for(predicate: Callable[[], bool], *, timeout: float = 2.0) -> N
 
 
 @pytest.mark.asyncio
-async def test_build_amplifiers_instantiates_one_driver_per_board(tmp_path) -> None:
-    """Each configured board gets its own driver, built from its own settings."""
+async def test_build_amplifiers_instantiates_one_driver_per_device(tmp_path) -> None:
+    """Each configured device gets its own driver, built from the shared transport."""
     worker = _make_worker(tmp_path)
     settings = make_settings(
-        [
-            make_amplifier_settings(
-                "a",
-                address=2,
-                serial=AmplifierSerialSettings(
-                    port="/dev/ttyUSB0",
-                    baudrate=38400,
-                    bytesize=7,
-                    parity="E",
-                    stopbits=2,
-                    timeout=0.5,
-                    framer="ASCII",
-                ),
-            ),
-            make_amplifier_settings("b", port="/dev/ttyUSB1", address=7),
-        ]
+        {
+            "a": make_device_settings(address=2),
+            "board_b": make_device_settings(address=7, label="Board B"),
+        },
+        transport=make_serial_transport(
+            port="/dev/ttyUSB0",
+            baudrate=38400,
+            bytesize=7,
+            parity="E",
+            stopbits=2,
+            timeout=0.5,
+            framer="ASCII",
+        ),
     )
 
     await worker._build_amplifiers(settings)
 
-    assert set(worker.amplifiers) == {"a", "b"}
+    assert set(worker.amplifiers) == {"a", "board_b"}
     first = worker.amplifiers["a"]
-    second = worker.amplifiers["b"]
+    second = worker.amplifiers["board_b"]
     assert isinstance(first, _FakeAmplifier)
     assert first is not second
 
+    # The driver's label is logging-only: it falls back to the device id.
     assert first.label == "a"
     assert first.address == 2
     assert first.logger is worker.logger
-
-    con_params = first.con_params
-    assert con_params.port == "/dev/ttyUSB0"
-    assert con_params.baudrate == 38400
-    assert con_params.bytesize == 7
-    assert con_params.parity == "E"
-    assert con_params.stopbits == 2
-    assert isinstance(con_params.stopbits, int)
-    assert con_params.timeout == 0.5
-    assert con_params.framer == "ASCII"
-
-    assert second.label == "b"
+    assert second.label == "Board B"
     assert second.address == 7
-    assert second.logger is worker.logger
-    assert second.con_params.port == "/dev/ttyUSB1"
-    assert second.con_params.baudrate == 19200
-    assert second.con_params.parity == "N"
-    assert second.con_params.framer == "RTU"
+
+    for amplifier in (first, second):
+        con_params = amplifier.con_params
+        assert con_params.port == "/dev/ttyUSB0"
+        assert con_params.baudrate == 38400
+        assert con_params.bytesize == 7
+        assert con_params.parity == "E"
+        assert con_params.stopbits == 2
+        assert isinstance(con_params.stopbits, int)
+        assert con_params.timeout == 0.5
+        assert con_params.framer == "ASCII"
 
     await worker.close_amplifiers()
     assert first.close_calls == 1
@@ -146,23 +139,41 @@ async def test_build_amplifiers_instantiates_one_driver_per_board(tmp_path) -> N
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("field", ["write_timeout", "inter_byte_timeout"])
+async def test_build_amplifiers_rejects_a_serial_timeout_the_hal_cannot_carry(tmp_path, field) -> None:
+    """A configured serial timeout the installed HAL drops fails with a labelled error.
+
+    The Modbus serial config in this HAL release accepts
+    ``write_timeout``/``inter_byte_timeout`` as unused kwargs, so a value would
+    be silently inert. The worker refuses instead of pretending.
+    """
+    worker = _make_worker(tmp_path)
+    settings = make_settings({"a": make_device_settings()}, transport=make_serial_transport(**{field: 0.5}))
+
+    with pytest.raises(ValueError, match=rf"device 'a': the installed scietex.hal.serial does not honour transport\.{field}"):
+        await worker._build_amplifiers(settings)
+
+    assert worker.amplifiers == {}
+
+
+@pytest.mark.asyncio
 async def test_relay_settle_forwarded_only_when_configured_and_supported(tmp_path, monkeypatch, caplog) -> None:
     """The settle delay reaches the driver only when set and accepted.
 
     A driver that declares no ``relay_settle_s`` keeps its own default and a
-    warning is logged instead of failing the whole board registry.
+    warning is logged instead of failing the whole device registry.
     """
     worker = _make_worker(tmp_path)
 
-    await worker._build_amplifiers(make_settings([make_amplifier_settings("default")]))
+    await worker._build_amplifiers(make_settings({"default": make_device_settings()}))
     assert worker.amplifiers["default"].relay_settle_s == pytest.approx(0.008)
 
-    await worker._build_amplifiers(make_settings([make_amplifier_settings("explicit", relay_settle_s=0.02)]))
+    await worker._build_amplifiers(make_settings({"explicit": make_device_settings(relay_settle_s=0.02)}))
     assert worker.amplifiers["explicit"].relay_settle_s == pytest.approx(0.02)
 
     register_fake_driver(monkeypatch, factory=_NoSettleAmplifier)
     with caplog.at_level(logging.WARNING):
-        await worker._build_amplifiers(make_settings([make_amplifier_settings("strict", relay_settle_s=0.05)]))
+        await worker._build_amplifiers(make_settings({"strict": make_device_settings(relay_settle_s=0.05)}))
 
     assert worker.amplifiers["strict"].relay_settle_s == pytest.approx(0.008)
     assert any("does not accept relay_settle_s" in record.getMessage() for record in caplog.records)
@@ -170,33 +181,12 @@ async def test_relay_settle_forwarded_only_when_configured_and_supported(tmp_pat
 
 
 @pytest.mark.asyncio
-async def test_build_amplifiers_rejects_duplicate_labels(tmp_path) -> None:
-    """Labels are the registry key, so a duplicate is a hard configuration error."""
-    worker = _make_worker(tmp_path)
-    # Distinct endpoints: the label clash is what this test is about.
-    settings = make_settings([make_amplifier_settings("dup"), make_amplifier_settings("dup", port="/dev/ttyUSB1")])
-
-    with pytest.raises(ValueError, match="Duplicate amplifier label 'dup'"):
-        await worker._build_amplifiers(settings)
-
-
-@pytest.mark.asyncio
 async def test_build_amplifiers_forwards_tcp_endpoint(tmp_path) -> None:
-    """A TCP board is built with the gateway endpoint, not a serial config."""
+    """A TCP device is built with the gateway endpoint, not a serial config."""
     worker = _make_worker(tmp_path)
     settings = make_settings(
-        [
-            make_tcp_amplifier_settings(
-                "preamp_1",
-                host="gateway.local",
-                port=1502,
-                address=9,
-                timeout=8.5,
-                retries=2,
-                relay_settle_s=0.02,
-            ),
-            make_amplifier_settings("board_b", port="/dev/ttyUSB1", address=4),
-        ]
+        {"preamp_1": make_device_settings(driver="ebic_modbus_tcp_v1", address=9, relay_settle_s=0.02)},
+        transport=make_tcp_transport(host="gateway.local", tcp_port=1502, tcp_timeout=8.5, tcp_retries=2),
     )
 
     await worker._build_amplifiers(settings)
@@ -213,11 +203,6 @@ async def test_build_amplifiers_forwards_tcp_endpoint(tmp_path) -> None:
     assert tcp.con_params is None
     assert tcp.relay_settle_s == pytest.approx(0.02)
 
-    serial = worker.amplifiers["board_b"]
-    assert isinstance(serial, _FakeAmplifier)
-    assert not isinstance(serial, _FakeTcpAmplifier)
-    assert serial.con_params.port == "/dev/ttyUSB1"
-
     await worker.close_amplifiers()
 
 
@@ -230,35 +215,36 @@ async def test_build_amplifiers_rejects_a_driver_that_contradicts_the_transport(
     must not hand a serial driver TCP keywords.
     """
     worker = _make_worker(tmp_path)
-    settings = make_settings([make_amplifier_settings("bad")])
-    object.__setattr__(settings.amplifiers[0], "transport", "tcp")
+    settings = make_settings({"bad": make_device_settings()}, transport=make_tcp_transport())
 
-    with pytest.raises(ValueError, match="is a rs485 driver but transport is 'tcp'"):
+    with pytest.raises(ValueError, match="is a rs485 driver but transport kind is 'tcp'"):
         await worker._build_amplifiers(settings)
 
     assert worker.amplifiers == {}
 
 
 @pytest.mark.asyncio
-async def test_build_amplifiers_names_the_board_on_invalid_serial_settings(tmp_path) -> None:
-    """A serial value the HAL rejects surfaces as a ValueError naming the label.
+async def test_build_amplifiers_names_the_device_on_invalid_serial_settings(tmp_path) -> None:
+    """A serial value the HAL rejects surfaces as a ValueError naming the device.
 
     ``baudrate=12345`` passes the config model's positive-value check but is not
     in the HAL's supported baud-rate list, so it fails while building the
     connection config rather than while parsing the file.
     """
     worker = _make_worker(tmp_path)
-    serial = AmplifierSerialSettings(port="/dev/ttyUSB0", baudrate=12345)
+    settings = make_settings({"bad": make_device_settings()}, transport=make_serial_transport(baudrate=12345))
 
-    with pytest.raises(ValueError, match="amplifier 'bad': invalid serial settings"):
-        await worker._build_amplifiers(make_settings([make_amplifier_settings("bad", serial=serial)]))
+    with pytest.raises(ValueError, match="device 'bad': invalid serial settings"):
+        await worker._build_amplifiers(settings)
 
 
 @pytest.mark.asyncio
-async def test_initialize_reports_bad_serial_as_startup_error_naming_the_label(tmp_path, caplog) -> None:
-    """Startup fails with an error that names the offending board."""
-    serial = AmplifierSerialSettings(port="/dev/ttyUSB0", baudrate=12345)
-    _write_config(tmp_path, make_settings([make_amplifier_settings("bad", serial=serial)]))
+async def test_initialize_reports_bad_serial_as_startup_error_naming_the_device(tmp_path, caplog) -> None:
+    """Startup fails with an error that names the offending device."""
+    _write_config(
+        tmp_path,
+        make_settings({"bad": make_device_settings()}, transport=make_serial_transport(baudrate=12345)),
+    )
     worker = _make_worker(tmp_path)
 
     with caplog.at_level(logging.ERROR):
@@ -269,19 +255,18 @@ async def test_initialize_reports_bad_serial_as_startup_error_naming_the_label(t
 
 
 @pytest.mark.asyncio
-async def test_initialize_reports_duplicate_label_as_startup_error(tmp_path, caplog) -> None:
-    """A duplicate label fails startup and is named in the log."""
-    _write_config(
-        tmp_path,
-        make_settings([make_amplifier_settings("dup"), make_amplifier_settings("dup", port="/dev/ttyUSB1")]),
-    )
+async def test_initialize_reports_invalid_config_as_startup_error(tmp_path, caplog) -> None:
+    """A config the model rejects fails startup and names the offending field."""
+    path = tmp_path / CURRENT_AMPLIFIER_CONFIG_SUBDIR / CURRENT_AMPLIFIER_CONFIG_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("transport:\n  port: /dev/ttyUSB0\ndevices:\n  dup_a:\n    address: 2\n  dup_b:\n    address: 2\n")
     worker = _make_worker(tmp_path)
 
     with caplog.at_level(logging.ERROR):
         assert await worker.initialize() is False
 
     messages = [record.getMessage() for record in caplog.records]
-    assert any("Duplicate amplifier label 'dup'" in message for message in messages)
+    assert any("share Modbus address 2" in message for message in messages)
 
 
 @pytest.mark.asyncio
@@ -292,13 +277,16 @@ async def test_initialize_seeds_registry_from_yaml(tmp_path, monkeypatch) -> Non
         return True
 
     monkeypatch.setattr(ValkeyWorker, "initialize", fake_initialize)
-    _write_config(tmp_path, make_settings([make_amplifier_settings("yaml", address=4)]))
+    _write_config(tmp_path, make_settings({"yaml": make_device_settings(address=4)}))
     worker = _make_worker(tmp_path)
 
     assert await worker.initialize() is True
     assert set(worker.amplifiers) == {"yaml"}
     assert worker.amplifier_settings["yaml"].address == 4
     assert worker._startup_complete is True
+    # Boot seeds the registry but never starts a poll loop.
+    assert worker.monitoring == {"yaml": False}
+    assert worker._poll_tasks == {}
     await worker.cleanup()
 
 
@@ -306,7 +294,7 @@ async def test_initialize_seeds_registry_from_yaml(tmp_path, monkeypatch) -> Non
 async def test_rebuild_closes_previous_drivers_once(tmp_path) -> None:
     """``_build_amplifiers`` is idempotent: the old registry is torn down once."""
     worker = _make_worker(tmp_path)
-    settings = make_settings([make_amplifier_settings("a")])
+    settings = make_settings({"a": make_device_settings()})
 
     await worker._build_amplifiers(settings)
     old = worker.amplifiers["a"]
@@ -321,10 +309,10 @@ async def test_rebuild_closes_previous_drivers_once(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_registry_maps_every_configured_label(tmp_path) -> None:
-    """The public maps share the configured labels and start zeroed."""
+async def test_registry_maps_every_device_id(tmp_path) -> None:
+    """The public maps share the configured device ids and start zeroed."""
     worker = _make_worker(tmp_path)
-    settings = make_settings([make_amplifier_settings("a"), make_amplifier_settings("b", port="/dev/ttyUSB1")])
+    settings = make_settings({"a": make_device_settings(address=2), "b": make_device_settings(address=3)})
 
     await worker._build_amplifiers(settings)
 
@@ -337,9 +325,8 @@ async def test_registry_maps_every_configured_label(tmp_path) -> None:
     assert worker.monitoring == {"a": False, "b": False}
     assert worker.connected == {"a": False, "b": False}
 
-    for label in expected:
-        assert worker.amplifier_settings[label].label == label
-        stats = worker.stats[label]
+    for device in expected:
+        stats = worker.stats[device]
         assert stats.reading_count == 0
         assert stats.error_count == 0
         assert stats.last_state is None
@@ -352,9 +339,15 @@ async def test_registry_maps_every_configured_label(tmp_path) -> None:
 
 @pytest.mark.asyncio
 async def test_poll_loop_publishes_one_reading_per_iteration(tmp_path, monkeypatch) -> None:
-    """One successful poll writes the full stream entry to the board's key."""
+    """One successful poll writes the full stream entry to the device's key.
+
+    The key segment is the device id, not the display label, so the label is
+    set to a different string to prove which one is used.
+    """
     worker = _make_worker(tmp_path)
-    await worker._build_amplifiers(make_settings([make_amplifier_settings("a", poll_interval=0.5)]))
+    await worker._build_amplifiers(
+        make_settings({"a": make_device_settings(label="Photodiode A", address=2, poll_interval=0.5)})
+    )
     worker.amplifiers["a"].state = AmplifierState(
         output_voltage_v=1.25,
         output_current_a=2.5e-3,
@@ -436,15 +429,15 @@ async def test_poll_loop_publishes_one_reading_per_iteration(tmp_path, monkeypat
 
 
 @pytest.mark.asyncio
-async def test_failure_of_one_board_does_not_stop_another(tmp_path, monkeypatch) -> None:
-    """Board A failing reads never escapes its task and leaves B publishing."""
+async def test_failure_of_one_device_does_not_stop_another(tmp_path, monkeypatch) -> None:
+    """Device A failing reads never escapes its task and leaves B publishing."""
     worker = _make_worker(tmp_path)
     await worker._build_amplifiers(
         make_settings(
-            [
-                make_amplifier_settings("a", poll_interval=0.001),
-                make_tcp_amplifier_settings("b", address=4, poll_interval=0.001),
-            ],
+            {
+                "a": make_device_settings(address=2, poll_interval=0.001),
+                "b": make_device_settings(address=4, poll_interval=0.001),
+            },
             failure_threshold=2,
         )
     )
@@ -480,7 +473,7 @@ async def test_failure_of_one_board_does_not_stop_another(tmp_path, monkeypatch)
         assert worker.stats["b"].consecutive_failures == 0
         assert worker.stats["b"].error_count == 0
 
-        # Board A published only the readings it completed before the bus
+        # Device A published only the readings it completed before the bus
         # failed; B kept publishing throughout.
         a_key = f"scietex:{worker.service_name}:{worker.instance_id}:current_amplifier:a:readings"
         b_key = f"scietex:{worker.service_name}:{worker.instance_id}:current_amplifier:b:readings"
@@ -496,9 +489,9 @@ async def test_failure_of_one_board_does_not_stop_another(tmp_path, monkeypatch)
 
 @pytest.mark.asyncio
 async def test_poll_loop_recovers_after_failed_reads(tmp_path, monkeypatch) -> None:
-    """A successful read resets the failure streak and reconnects the board."""
+    """A successful read resets the failure streak and reconnects the device."""
     worker = _make_worker(tmp_path)
-    await worker._build_amplifiers(make_settings([make_amplifier_settings("a", poll_interval=0.001)], failure_threshold=2))
+    await worker._build_amplifiers(make_settings({"a": make_device_settings(poll_interval=0.001)}, failure_threshold=2))
     amplifier = worker.amplifiers["a"]
     amplifier.read_exc = RuntimeError("bus down")
 
@@ -528,10 +521,10 @@ async def test_poll_loop_recovers_after_failed_reads(tmp_path, monkeypatch) -> N
 
 @pytest.mark.asyncio
 async def test_failed_polls_back_off_exponentially_and_reset_on_success(tmp_path, monkeypatch) -> None:
-    """A failing board backs off to 10x the interval; one success returns to base."""
+    """A failing device backs off to 10x the interval; one success returns to base."""
     worker = _make_worker(tmp_path)
     interval = 0.01
-    await worker._build_amplifiers(make_settings([make_amplifier_settings("a", poll_interval=interval)], failure_threshold=1))
+    await worker._build_amplifiers(make_settings({"a": make_device_settings(poll_interval=interval)}, failure_threshold=1))
     amplifier = worker.amplifiers["a"]
     amplifier.read_exc = RuntimeError("bus down")
 
@@ -540,7 +533,7 @@ async def test_failed_polls_back_off_exponentially_and_reset_on_success(tmp_path
     async def record(delay: float) -> None:
         delays.append(delay)
         if len(delays) == 4:
-            # The board answers again; the next poll must not wait for the backoff.
+            # The device answers again; the next poll must not wait for the backoff.
             amplifier.read_exc = None
         if len(delays) >= 6:
             raise asyncio.CancelledError
@@ -564,21 +557,21 @@ async def test_failed_polls_back_off_exponentially_and_reset_on_success(tmp_path
 
 
 def test_poll_delay_stays_capped_for_a_long_outage(tmp_path) -> None:
-    """A board down for thousands of polls stays at the cap instead of overflowing."""
+    """A device down for thousands of polls stays at the cap instead of overflowing."""
     worker = _make_worker(tmp_path)
     stats = AmplifierStats(consecutive_failures=5000)
 
-    delay = worker._poll_delay(make_amplifier_settings("a", poll_interval=1.0), stats)
+    delay = worker._poll_delay(make_device_settings(poll_interval=1.0), stats)
 
     assert delay == pytest.approx(10.0)
 
 
 @pytest.mark.asyncio
-async def test_gateway_busy_backs_off_without_marking_the_board_disconnected(tmp_path, monkeypatch) -> None:
-    """A contended gateway is retried with backoff but the board stays connected."""
+async def test_gateway_busy_backs_off_without_marking_the_device_disconnected(tmp_path, monkeypatch) -> None:
+    """A contended gateway is retried with backoff but the device stays connected."""
     worker = _make_worker(tmp_path)
     interval = 0.01
-    await worker._build_amplifiers(make_settings([make_amplifier_settings("a", poll_interval=interval)], failure_threshold=1))
+    await worker._build_amplifiers(make_settings({"a": make_device_settings(poll_interval=interval)}, failure_threshold=1))
     worker.amplifiers["a"].read_exc = GatewayBusy("busy")
     worker._connected["a"] = True
 
@@ -603,11 +596,9 @@ async def test_gateway_busy_backs_off_without_marking_the_board_disconnected(tmp
 
 @pytest.mark.asyncio
 async def test_start_and_stop_monitoring(tmp_path) -> None:
-    """Monitoring selection is per label, idempotent, and rejects unknown labels."""
+    """Monitoring selection is per device id, idempotent, and rejects unknown ids."""
     worker = _make_worker(tmp_path)
-    await worker._build_amplifiers(
-        make_settings([make_amplifier_settings("a"), make_amplifier_settings("b", port="/dev/ttyUSB1")])
-    )
+    await worker._build_amplifiers(make_settings({"a": make_device_settings(address=2), "b": make_device_settings(address=3)}))
 
     assert worker.start_monitoring("a") == ["a"]
     task_a = worker._poll_tasks["a"]
@@ -622,7 +613,7 @@ async def test_start_and_stop_monitoring(tmp_path) -> None:
     with pytest.raises(KeyError):
         worker.stop_monitoring("unknown")
 
-    # Start all: only the not-yet-monitoring labels are returned.
+    # Start all: only the not-yet-monitoring devices are returned.
     assert worker.start_monitoring() == ["b"]
     task_b = worker._poll_tasks["b"]
 
@@ -630,7 +621,7 @@ async def test_start_and_stop_monitoring(tmp_path) -> None:
     assert worker.monitoring["a"] is False
     assert worker.connected["a"] is False
 
-    # Stopping an already stopped board is a no-op.
+    # Stopping an already stopped device is a no-op.
     assert worker.stop_monitoring("a") == []
 
     assert worker.stop_monitoring() == ["b"]
@@ -643,16 +634,75 @@ async def test_start_and_stop_monitoring(tmp_path) -> None:
     await worker.close_amplifiers()
 
 
+@pytest.mark.asyncio
+async def test_start_monitoring_skips_devices_out_of_the_poll_plan(tmp_path) -> None:
+    """A ``poll=false`` device is never started, even when named explicitly."""
+    worker = _make_worker(tmp_path)
+    await worker._build_amplifiers(
+        make_settings(
+            {
+                "polled": make_device_settings(address=2, poll=True),
+                "on_demand": make_device_settings(address=3, poll=False),
+            }
+        )
+    )
+
+    assert worker.start_monitoring() == ["polled"]
+    assert worker.start_monitoring("on_demand") == []
+    assert worker._poll_tasks.keys() == {"polled"}
+    assert worker.monitoring == {"polled": True, "on_demand": False}
+    await worker.close_amplifiers()
+
+
+@pytest.mark.asyncio
+async def test_poll_enabled_false_starts_nothing(tmp_path) -> None:
+    """``poll_enabled=false`` gates the whole poll plan."""
+    worker = _make_worker(tmp_path)
+    await worker._build_amplifiers(
+        make_settings({"a": make_device_settings(), "b": make_device_settings(address=3)}, poll_enabled=False)
+    )
+
+    assert worker.start_monitoring() == []
+    assert worker.start_monitoring("a") == []
+    assert worker._poll_tasks == {}
+    assert worker.monitoring == {"a": False, "b": False}
+    await worker.close_amplifiers()
+
+
+@pytest.mark.asyncio
+async def test_on_demand_read_of_a_poll_false_device_still_works(tmp_path, monkeypatch) -> None:
+    """A device outside the poll plan publishes a reading when polled explicitly."""
+    worker = _make_worker(tmp_path)
+    await worker._build_amplifiers(make_settings({"on_demand": make_device_settings(address=3, poll=False)}))
+
+    client = _FakeClient()
+    monkeypatch.setattr(worker, "_client", client)
+
+    async def cancel_after_one(_delay: float) -> None:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(worker, "_sleep", cancel_after_one)
+
+    with pytest.raises(asyncio.CancelledError):
+        await worker._poll_amplifier("on_demand")
+
+    assert worker.stats["on_demand"].reading_count == 1
+    assert [key for key, _, _ in client.calls] == [
+        f"scietex:{worker.service_name}:{worker.instance_id}:current_amplifier:on_demand:readings"
+    ]
+    await worker.close_amplifiers()
+
+
 def test_restart_required_after_post_startup_apply(tmp_path) -> None:
     """A settings apply before startup only stores; after startup it needs a restart."""
     worker = _make_worker(tmp_path)
     assert worker.restart_required is False
 
-    worker._apply_settings(make_settings([]))
+    worker._apply_settings(make_settings())
     assert worker.restart_required is False
 
     worker._startup_complete = True
-    worker._apply_settings(make_settings([make_amplifier_settings("a")]))
+    worker._apply_settings(make_settings({"a": make_device_settings()}))
     assert worker.restart_required is True
 
 
@@ -660,9 +710,7 @@ def test_restart_required_after_post_startup_apply(tmp_path) -> None:
 async def test_cleanup_cancels_poll_tasks_and_closes_drivers(tmp_path) -> None:
     """The shutdown path cancels every poll task and closes each driver once."""
     worker = _make_worker(tmp_path)
-    await worker._build_amplifiers(
-        make_settings([make_amplifier_settings("a"), make_amplifier_settings("b", port="/dev/ttyUSB1")])
-    )
+    await worker._build_amplifiers(make_settings({"a": make_device_settings(address=2), "b": make_device_settings(address=3)}))
     amplifier_a = worker.amplifiers["a"]
     amplifier_b = worker.amplifiers["b"]
 

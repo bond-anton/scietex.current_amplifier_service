@@ -1,26 +1,25 @@
 """Configuration models and YAML loader for the current amplifier service.
 
 `CurrentAmplifierServiceSettings` is the concrete constructor (L0) base and the
-validation target for the service's remote configuration. The amplifier list is
-a field-level map merged onto L0 and overlaid by the remote `current_amplifier`
-section (L3).
+validation target for the service's remote configuration. Devices are a map
+keyed by the worker device id; the map is merged onto L0 field-by-field and
+overlaid by the remote `current_amplifier` section (L3).
 
 This module is deliberately **not** registered as an L1 bootstrap provider. The
 worker reads `current_amplifier.yml` directly at startup (before
-`super().initialize()`) and uses it only to seed the initial in-memory amplifier
-list; the config section is registered with `bootstrap=None`, so L1 never enters
+`super().initialize()`) and uses it only to seed the initial in-memory device
+map; the config section is registered with `bootstrap=None`, so L1 never enters
 the layer stack and the remote L3 config cleanly replaces it. Trade-off:
 `config:show` will not display it as a layer.
 
-A board is reached either over its own RS485 port (``transport: rs485``, the
-default) or through a Modbus/TCP gateway (``transport: tcp``), so the
-transport-specific connection settings live on the board. Exactly one of the
-``serial`` / ``tcp`` blocks is set, and it must agree with ``transport`` and with
-the driver family. Field domains are validated here as well as by
-`ModbusSerialConnectionConfig` at build time: the duplicate check turns a bad
-parity/framer/bytesize into a clean config-load error instead of a registry
-construction failure. Validation raises `ValueError`, which `msgspec.convert`
-reports as a `msgspec.ValidationError`.
+A service reaches its segment either over one RS485 port (``kind: rs485``, the
+default) or through one Modbus/TCP gateway (``kind: tcp``). The transport is
+service-wide, not per-device: one row describes one segment, and the Modbus
+slave ``address`` selects the board behind it. Field domains are validated here
+as well as by `ModbusSerialConnectionConfig` at build time, so a bad
+parity/framer/bytesize fails at config load instead of during registry
+construction. Validation raises `ValueError`, which `msgspec.convert` reports as
+a `msgspec.ValidationError`.
 """
 
 from pathlib import Path
@@ -39,52 +38,20 @@ CURRENT_AMPLIFIER_CONFIG_SUBDIR: str = "current_amplifier"
 CURRENT_AMPLIFIER_CONFIG_FILE: str = "current_amplifier.yml"
 
 
-class AmplifierSerialSettings(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
-    """Serial connection settings for one Modbus RTU segment.
+class AmplifierTransportSettings(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
+    """How the service reaches its segment: one RS485 port or one Modbus/TCP gateway.
 
-    Maps onto `scietex.hal.serial.ModbusSerialConnectionConfig` at registry
-    construction time. Defaults follow the EBIC v1.0 firmware: 19200 baud, 8N1
-    with RTU framing.
-    """
+    Field-for-field the API plugin's ``CurrentAmplifierWorkerTransport``.
+    ``kind`` defaults to ``"rs485"`` so a payload that predates the
+    discriminator still decodes as a direct serial segment. ``port`` is the
+    serial device path and never a TCP port; the gateway port is ``tcp_port``.
 
-    port: str
-    baudrate: int = 19200
-    bytesize: int = 8
-    parity: str = "N"
-    stopbits: float = 1
-    timeout: float = 1.0
-    framer: str = "RTU"
-
-    def __post_init__(self) -> None:
-        if self.baudrate <= 0:
-            raise ValueError(f"serial.baudrate must be positive, got {self.baudrate}")
-        if self.bytesize not in (5, 6, 7, 8):
-            raise ValueError(f"serial.bytesize must be one of 5, 6, 7, 8, got {self.bytesize}")
-        if self.parity not in ("N", "E", "O"):
-            raise ValueError(f"serial.parity must be one of N, E, O, got {self.parity!r}")
-        if self.stopbits not in (1, 1.5, 2):
-            raise ValueError(f"serial.stopbits must be one of 1, 1.5, 2, got {self.stopbits}")
-        if self.timeout < 0:
-            raise ValueError(f"serial.timeout must be non-negative, got {self.timeout}")
-        if self.framer not in ("RTU", "ASCII"):
-            raise ValueError(f"serial.framer must be RTU or ASCII, got {self.framer!r}")
-
-
-class AmplifierTcpSettings(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
-    """Modbus/TCP gateway endpoint for one board.
-
-    ``host`` is the gateway; the Modbus ``address`` still selects the board
-    behind it, so several boards may share one ``host:port``.
-
-    ``timeout`` is the per-request client timeout. It must *exceed* the
-    gateway's published ``client_timeout_floor``, not merely the device response
-    time: the gateway may hold the RS485 bus through reconnect and retry work
-    before it answers or gives up. The old reasoning — a budget of
-    ``lock_wait + hold`` — was insufficient because it ignored the gateway's
-    reconnect, per-retry and resync overhead.
-
-    With ``t = serial.timeout``, ``r = bus_retries`` and ``q = bus_queue_depth``
-    the gateway sizes its timeouts as::
+    ``tcp_timeout`` is a separate field from ``timeout`` on purpose. ``timeout``
+    is the serial per-response wait (default 1.0 s), while the TCP client
+    timeout must *exceed* the gateway's published ``client_timeout_floor`` — it
+    may hold the RS485 bus through reconnect and retry work before it answers or
+    gives up. With ``t = serial.timeout``, ``r = bus_retries`` and
+    ``q = bus_queue_depth`` the gateway sizes its timeouts as::
 
         B = t + 0.1 + (r + 1) * t          # bus_timeout
         s = 2 * t + 0.1                    # resync overhead
@@ -92,30 +59,67 @@ class AmplifierTcpSettings(msgspec.Struct, frozen=True, forbid_unknown_fields=Tr
         client_timeout_floor = request_timeout + B + s
 
     The 30.0 s default is sized for ``serial.timeout: 1.0``, ``bus_retries: 0``
-    and ``bus_queue_depth: 4`` (floor 26.2 s), leaving margin. A gateway left at
-    the 3.0 s serial fallback (``q=4`` → floor 76.2 s) needs roughly 80 s, which
-    is why the README recommends an explicit ``serial.timeout``; a value below
-    the floor reports normal bus contention as an unreachable board.
+    and ``bus_queue_depth: 4`` (floor 26.2 s), leaving margin. Sharing
+    ``timeout`` would silently install a 1.0 s client timeout against that
+    26.2 s floor and report normal bus contention as an unreachable board.
 
-    ``retries`` is pymodbus's per-request retry count. Zero keeps an ambiguous
-    write from being sent twice: a retry after a timeout re-sends a request whose
-    first copy may still be executing.
+    ``tcp_retries`` is pymodbus's per-request retry count. Zero keeps an
+    ambiguous write from being sent twice: a retry after a timeout re-sends a
+    request whose first copy may still be executing.
     """
 
-    host: str
-    port: int = 502
-    timeout: float = 30.0
-    retries: int = 0
+    kind: str = "rs485"
+    # serial
+    port: str | None = None
+    baudrate: int = 9600
+    bytesize: int = 8
+    parity: str = "N"
+    stopbits: float = 1.0
+    timeout: float = 1.0
+    write_timeout: float | None = None
+    inter_byte_timeout: float | None = None
+    framer: str = "RTU"
+    # tcp
+    host: str | None = None
+    tcp_port: int = 502
+    tcp_timeout: float = 30.0
+    tcp_retries: int = 0
 
     def __post_init__(self) -> None:
-        if not self.host:
-            raise ValueError("tcp.host must not be empty")
-        if not 1 <= self.port <= 65535:
-            raise ValueError(f"tcp.port must be within 1..65535, got {self.port}")
-        if self.timeout <= 0:
-            raise ValueError(f"tcp.timeout must be positive, got {self.timeout}")
-        if self.retries < 0:
-            raise ValueError(f"tcp.retries must be non-negative, got {self.retries}")
+        if self.kind not in TRANSPORTS:
+            raise ValueError(f"transport.kind must be one of {', '.join(TRANSPORTS)}, got {self.kind!r}")
+        if self.baudrate <= 0:
+            raise ValueError(f"transport.baudrate must be positive, got {self.baudrate}")
+        if self.bytesize not in (5, 6, 7, 8):
+            raise ValueError(f"transport.bytesize must be one of 5, 6, 7, 8, got {self.bytesize}")
+        if self.parity not in ("N", "E", "O"):
+            raise ValueError(f"transport.parity must be one of N, E, O, got {self.parity!r}")
+        if self.stopbits not in (1, 1.5, 2):
+            raise ValueError(f"transport.stopbits must be one of 1, 1.5, 2, got {self.stopbits}")
+        if self.timeout < 0:
+            raise ValueError(f"transport.timeout must be non-negative, got {self.timeout}")
+        if self.write_timeout is not None and self.write_timeout < 0:
+            raise ValueError(f"transport.write_timeout must be non-negative, got {self.write_timeout}")
+        if self.inter_byte_timeout is not None and self.inter_byte_timeout < 0:
+            raise ValueError(f"transport.inter_byte_timeout must be non-negative, got {self.inter_byte_timeout}")
+        if self.framer not in ("RTU", "ASCII"):
+            raise ValueError(f"transport.framer must be RTU or ASCII, got {self.framer!r}")
+        if self.kind == "rs485":
+            if not self.port:
+                raise ValueError("transport 'rs485' requires 'port'")
+            if self.host is not None:
+                raise ValueError("transport 'rs485' must not set 'host'")
+        else:
+            if not self.host:
+                raise ValueError("transport 'tcp' requires 'host'")
+            if self.port is not None:
+                raise ValueError("transport 'tcp' must not set 'port'")
+            if not 1 <= self.tcp_port <= 65535:
+                raise ValueError(f"transport.tcp_port must be within 1..65535, got {self.tcp_port}")
+            if self.tcp_timeout <= 0:
+                raise ValueError(f"transport.tcp_timeout must be positive, got {self.tcp_timeout}")
+            if self.tcp_retries < 0:
+                raise ValueError(f"transport.tcp_retries must be non-negative, got {self.tcp_retries}")
 
 
 #: Transport each known driver family speaks, matched by entry point prefix.
@@ -128,7 +132,7 @@ DRIVER_TRANSPORT_PREFIXES: tuple[tuple[str, str], ...] = (
     ("ebic_modbus_v1", "rs485"),
 )
 
-#: The transports a board may use.
+#: The transports a service may use.
 TRANSPORTS: tuple[str, ...] = ("rs485", "tcp")
 
 
@@ -149,105 +153,58 @@ def transport_for_driver(driver: str) -> str | None:
     return None
 
 
-class AmplifierSettings(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
-    """Settings for a single current amplifier board driven by the service.
+class AmplifierDeviceSettings(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
+    """Settings for one current amplifier board driven by the service.
 
-    ``label`` is the unique stream-key segment for the board. ``transport``
-    selects how the board is reached and decides which connection block is
-    required: ``rs485`` needs ``serial`` (the board's own RS485 port), ``tcp``
-    needs ``tcp`` (a Modbus/TCP gateway endpoint). Exactly one block is set, and
-    it must agree with ``transport`` and with the driver family — see
-    ``DRIVER_TRANSPORT_PREFIXES``.
+    The map key is the device identity and the key segment of the board's
+    readings stream; ``label`` is a display string only. ``driver`` is the entry
+    point name of a `scietex.hal.current_amplifier` driver resolved at runtime,
+    e.g. ``ebic_modbus_v1``; it must speak the service-wide transport.
 
-    ``driver`` is the entry point name of a `scietex.hal.current_amplifier`
-    driver resolved at runtime, e.g. ``ebic_modbus_v1``. ``address`` is the
-    Modbus slave address (EBIC default 2); every board on one segment — or
-    behind one gateway — needs a distinct one.
+    ``address`` is the Modbus slave address and identifies the board on the
+    shared segment, so it defaults to the plugin's value and no two devices may
+    share one.
 
-    ``relay_settle_s`` is optional and constructor-only: it is forwarded to the
-    driver only when set and only if the driver accepts the keyword. ``None``
+    ``poll`` excludes a device from the poll plan; it stays readable on demand.
+    ``relay_settle_s`` is worker-only and constructor-only: it is forwarded to
+    the driver only when set and only if the driver accepts the keyword. ``None``
     leaves the driver's own default (8 ms) in place.
     """
 
-    label: str
-    serial: AmplifierSerialSettings | None = None
-    tcp: AmplifierTcpSettings | None = None
-    transport: str = "rs485"
     driver: str = "ebic_modbus_v1"
-    address: int = 2
+    address: int = 1
+    label: str | None = None
+    poll: bool = True
     poll_interval: float = 1.0
     relay_settle_s: float | None = None
-
-    def __post_init__(self) -> None:
-        if self.transport not in TRANSPORTS:
-            raise ValueError(
-                f"amplifier {self.label!r}: transport must be one of {', '.join(TRANSPORTS)}, got {self.transport!r}"
-            )
-        if (self.serial is None) == (self.tcp is None):
-            raise ValueError(
-                f"amplifier {self.label!r}: exactly one of 'serial' or 'tcp' must be set, "
-                f"got serial={'set' if self.serial is not None else 'unset'}, "
-                f"tcp={'set' if self.tcp is not None else 'unset'}"
-            )
-        if self.transport == "tcp":
-            if self.tcp is None:
-                raise ValueError(f"amplifier {self.label!r}: transport 'tcp' requires the 'tcp' block, not 'serial'")
-        elif self.serial is None:
-            raise ValueError(f"amplifier {self.label!r}: transport 'rs485' requires the 'serial' block, not 'tcp'")
-        driver_transport = transport_for_driver(self.driver)
-        if driver_transport is not None and driver_transport != self.transport:
-            raise ValueError(
-                f"amplifier {self.label!r}: driver {self.driver!r} is a {driver_transport} driver "
-                f"but transport is {self.transport!r}"
-            )
-        if not 1 <= self.address <= 247:
-            raise ValueError(f"amplifier {self.label!r}: address must be within 1..247, got {self.address}")
-        if self.poll_interval <= 0:
-            raise ValueError(f"amplifier {self.label!r}: poll_interval must be positive, got {self.poll_interval}")
-        if self.relay_settle_s is not None and self.relay_settle_s < 0:
-            raise ValueError(f"amplifier {self.label!r}: relay_settle_s must be non-negative, got {self.relay_settle_s}")
-
-    def serial_block(self) -> AmplifierSerialSettings:
-        """The RS485 block, narrowed to non-`None`.
-
-        Raises:
-            ValueError: If the board is not configured with a ``serial`` block.
-        """
-        if self.serial is None:
-            raise ValueError(f"amplifier {self.label!r}: no 'serial' block configured")
-        return self.serial
-
-    def tcp_block(self) -> AmplifierTcpSettings:
-        """The Modbus/TCP block, narrowed to non-`None`.
-
-        Raises:
-            ValueError: If the board is not configured with a ``tcp`` block.
-        """
-        if self.tcp is None:
-            raise ValueError(f"amplifier {self.label!r}: no 'tcp' block configured")
-        return self.tcp
 
 
 class CurrentAmplifierServiceSettings(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
     """Top-level current amplifier service settings.
 
-    ``failure_threshold`` and ``stream_maxlen`` are service-wide rather than
-    per-board: the readings streams share one retention policy, and the noise
-    tolerance is a property of the service rather than of a single board.
+    ``name`` is carried by the plugin's payload and accepted for compatibility;
+    the instance name is framework-owned and the field is ignored.
 
-    A board's identity is its endpoint plus its Modbus address. For RS485 that
-    is ``(serial.port, address)``: a port may carry several boards as long as
-    each has its own address. For TCP it is ``(tcp.host, tcp.port, address)``:
-    several boards legitimately share one gateway and differ only by address.
-    A duplicate pair is rejected, duplicate endpoints are not.
+    ``devices`` is keyed by the worker device id. The transport is service-wide,
+    so the Modbus ``address`` alone identifies a board and a duplicate is
+    rejected. A device id must be non-empty: it is a stream-key segment.
+
+    ``poll_enabled`` gates the poll plan as a whole; ``failure_threshold`` and
+    ``stream_maxlen`` are service-wide because the readings streams share one
+    retention policy and the noise tolerance is a property of the service.
     """
 
-    amplifiers: list[AmplifierSettings] = msgspec.field(default_factory=list)
+    transport: AmplifierTransportSettings
+    name: str | None = None
+    devices: dict[str, AmplifierDeviceSettings] = msgspec.field(default_factory=dict)
+    #: Whether any device is polled at all. A device is additionally excluded
+    #: by its own ``poll`` flag.
+    poll_enabled: bool = True
     #: Consecutive failed reads before a board is reported as disconnected.
     #: One failed read is common on an RS485 segment, so a single glitch must
     #: not flip the status icon.
     failure_threshold: int = 3
-    #: Entries retained per board's readings stream.
+    #: Entries retained per device's readings stream.
     stream_maxlen: int = 10000
 
     def __post_init__(self) -> None:
@@ -255,51 +212,40 @@ class CurrentAmplifierServiceSettings(msgspec.Struct, frozen=True, forbid_unknow
             raise ValueError(f"failure_threshold must be at least 1, got {self.failure_threshold}")
         if self.stream_maxlen < 1:
             raise ValueError(f"stream_maxlen must be at least 1, got {self.stream_maxlen}")
-        self._validate_endpoints()
+        self._validate_devices()
 
-    def _validate_endpoints(self) -> None:
-        """Reject two boards that address the same device.
-
-        The comparison trims the host and the serial path and case-folds the
-        host, because DNS names are case-insensitive and a padded path is a
-        typo, not a second device. Deeper equivalence is deliberately not
-        attempted: a host alias, an IPv4 literal versus its name, and a serial
-        symlink (``/dev/serial/by-id/...``) versus its target each still pass,
-        since resolving them would put DNS or filesystem I/O in config
-        validation.
+    def _validate_devices(self) -> None:
+        """Validate device ids and reject two devices addressing the same board.
 
         Raises:
-            ValueError: On a duplicate ``(port, address)`` for an RS485 board or
-                a duplicate ``(host, port, address)`` for a TCP board.
+            ValueError: On an empty device id, an address outside 1..247, a
+                non-positive ``poll_interval``, a negative ``relay_settle_s``, or
+                two devices sharing one Modbus address.
         """
-        serial_claims: dict[tuple[str, int], str] = {}
-        tcp_claims: dict[tuple[str, int, int], str] = {}
-        for board in self.amplifiers:
-            if board.transport == "tcp":
-                tcp = board.tcp_block()
-                key_tcp = (tcp.host.strip().casefold(), tcp.port, board.address)
-                owner = tcp_claims.get(key_tcp)
-                if owner is not None:
-                    raise ValueError(
-                        f"amplifiers {owner!r} and {board.label!r} share the same Modbus/TCP endpoint "
-                        f"{tcp.host}:{tcp.port} with address {board.address}"
-                    )
-                tcp_claims[key_tcp] = board.label
-            else:
-                serial = board.serial_block()
-                key_serial = (serial.port.strip(), board.address)
-                owner = serial_claims.get(key_serial)
-                if owner is not None:
-                    raise ValueError(
-                        f"amplifiers {owner!r} and {board.label!r} share serial port {serial.port!r} "
-                        f"with address {board.address}"
-                    )
-                serial_claims[key_serial] = board.label
+        owners: dict[int, str] = {}
+        for device_id, device in self.devices.items():
+            if not device_id:
+                raise ValueError("device id must not be empty")
+            if not 1 <= device.address <= 247:
+                raise ValueError(f"device {device_id!r}: address must be within 1..247, got {device.address}")
+            if device.poll_interval <= 0:
+                raise ValueError(f"device {device_id!r}: poll_interval must be positive, got {device.poll_interval}")
+            if device.relay_settle_s is not None and device.relay_settle_s < 0:
+                raise ValueError(f"device {device_id!r}: relay_settle_s must be non-negative, got {device.relay_settle_s}")
+            owner = owners.get(device.address)
+            if owner is not None:
+                raise ValueError(
+                    f"devices {owner!r} and {device_id!r} share Modbus address {device.address} on the same transport"
+                )
+            owners[device.address] = device_id
 
 
 #: Concrete L0 base for the service's configuration merge. A field absent from
 #: every layer, or explicitly cleared with ``null``, resolves to the value here.
-CURRENT_AMPLIFIER_SETTINGS_DEFAULTS: CurrentAmplifierServiceSettings = CurrentAmplifierServiceSettings()
+#: The placeholder port is the documented HAL example.
+CURRENT_AMPLIFIER_SETTINGS_DEFAULTS: CurrentAmplifierServiceSettings = CurrentAmplifierServiceSettings(
+    transport=AmplifierTransportSettings(port="/dev/ttyUSB0")
+)
 
 
 def read_current_amplifier_config(conf_dir: Path | None, *, create_default: bool = True) -> dict[str, object]:
@@ -350,7 +296,7 @@ def read_current_amplifier_config(conf_dir: Path | None, *, create_default: bool
     amplifier_yml = service_dir.joinpath(CURRENT_AMPLIFIER_CONFIG_FILE)
     if not amplifier_yml.exists():
         if create_default:
-            settings = CurrentAmplifierServiceSettings()
+            settings = CURRENT_AMPLIFIER_SETTINGS_DEFAULTS
             with open(amplifier_yml, "wb") as f:
                 f.write(msgspec.yaml.encode(settings))
             return msgspec.to_builtins(settings)

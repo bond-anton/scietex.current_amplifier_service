@@ -8,9 +8,9 @@ import msgspec
 import pytest
 from _helpers import (
     FAKE_DRIVER_NAME,
-    make_amplifier_settings,
+    make_device_settings,
     make_settings,
-    make_tcp_amplifier_settings,
+    make_tcp_transport,
     register_fake_driver,
 )
 from scietex.hal.current_amplifier.base.capabilities import FilterType
@@ -41,11 +41,11 @@ def _make_worker(tmp_path) -> CurrentAmplifierWorker:
     )
 
 
-async def _worker_with_boards(tmp_path, labels: list[str]) -> CurrentAmplifierWorker:
-    """Build a worker whose registry holds one fake board per label."""
+async def _worker_with_devices(tmp_path, device_ids: list[str]) -> CurrentAmplifierWorker:
+    """Build a worker whose registry holds one fake device per id."""
     worker = _make_worker(tmp_path)
     await worker._build_amplifiers(
-        make_settings([make_amplifier_settings(label, port=f"/dev/ttyUSB{index}") for index, label in enumerate(labels)])
+        make_settings({device_id: make_device_settings(address=index + 2) for index, device_id in enumerate(device_ids)})
     )
     return worker
 
@@ -99,9 +99,9 @@ def test_build_telemetry_unconfigured(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_devices_keyed_by_label_with_state_precedence(tmp_path) -> None:
-    """The devices map is keyed and sorted by label, with error winning over monitoring."""
-    worker = await _worker_with_boards(tmp_path, ["b", "a"])
+async def test_devices_keyed_by_device_id_with_state_precedence(tmp_path) -> None:
+    """The devices map is keyed and sorted by device id, with error winning over monitoring."""
+    worker = await _worker_with_devices(tmp_path, ["b", "a"])
     reading_at = datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
 
     healthy = worker.stats["b"]
@@ -164,30 +164,54 @@ async def test_devices_keyed_by_label_with_state_precedence(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_device_transport_matches_the_list_payload(tmp_path) -> None:
-    """Each telemetry entry carries the same transport as ``amplifier:list``."""
+async def test_label_is_a_display_extra_not_the_identity(tmp_path) -> None:
+    """The map key is the device id; the configured label rides alongside it."""
     worker = _make_worker(tmp_path)
     await worker._build_amplifiers(
         make_settings(
-            [
-                make_amplifier_settings("wired", port="/dev/ttyUSB0"),
-                make_tcp_amplifier_settings("gatewayed", host="gateway.local"),
-            ]
+            {
+                "photodiode_a": make_device_settings(label="Photodiode A", address=2),
+                "labelled_absent": make_device_settings(address=3),
+            }
         )
     )
 
     devices = build_telemetry(worker).devices
 
-    assert devices["wired"].transport == "rs485"
-    assert devices["gatewayed"].transport == "tcp"
+    assert list(devices) == ["labelled_absent", "photodiode_a"]
+    assert devices["photodiode_a"].label == "Photodiode A"
+    assert devices["labelled_absent"].label is None
 
     await worker.close_amplifiers()
 
 
 @pytest.mark.asyncio
+async def test_device_transport_matches_the_list_payload(tmp_path) -> None:
+    """Every telemetry entry carries the service-wide transport as ``amplifier:list`` does."""
+    serial_worker = _make_worker(tmp_path / "serial")
+    await serial_worker._build_amplifiers(make_settings({"wired": make_device_settings(address=2)}))
+    assert build_telemetry(serial_worker).devices["wired"].transport == "rs485"
+    await serial_worker.close_amplifiers()
+
+    tcp_worker = _make_worker(tmp_path / "tcp")
+    await tcp_worker._build_amplifiers(
+        make_settings(
+            {
+                "gatewayed_a": make_device_settings(driver="ebic_modbus_tcp_v1", address=2),
+                "gatewayed_b": make_device_settings(driver="ebic_modbus_tcp_v1", address=3),
+            },
+            transport=make_tcp_transport(host="gateway.local"),
+        )
+    )
+    devices = build_telemetry(tcp_worker).devices
+    assert {device.transport for device in devices.values()} == {"tcp"}
+    await tcp_worker.close_amplifiers()
+
+
+@pytest.mark.asyncio
 async def test_device_state_order_error_monitoring_ok_idle(tmp_path) -> None:
     """A failing poll beats monitoring, which beats a reading, which beats idle."""
-    worker = await _worker_with_boards(tmp_path, ["error", "monitoring", "ok", "idle"])
+    worker = await _worker_with_devices(tmp_path, ["error", "monitoring", "ok", "idle"])
     state = _sample_state()
 
     worker.stats["error"].last_state = state
@@ -202,7 +226,7 @@ async def test_device_state_order_error_monitoring_ok_idle(tmp_path) -> None:
 
     telemetry = build_telemetry(worker)
 
-    assert {label: device.state for label, device in telemetry.devices.items()} == {
+    assert {device: entry.state for device, entry in telemetry.devices.items()} == {
         "error": "error",
         "monitoring": "monitoring",
         "ok": "ok",
@@ -211,7 +235,7 @@ async def test_device_state_order_error_monitoring_ok_idle(tmp_path) -> None:
     assert telemetry.state == "running"
 
     # A configured worker with no poll task reports the idle service badge.
-    worker._monitoring = {label: False for label in worker.monitoring}
+    worker._monitoring = {device: False for device in worker.monitoring}
     assert build_telemetry(worker).state == "idle"
 
     await worker.close_amplifiers()
@@ -220,7 +244,7 @@ async def test_device_state_order_error_monitoring_ok_idle(tmp_path) -> None:
 @pytest.mark.asyncio
 async def test_msgpack_roundtrip_preserves_the_wire_contract(tmp_path) -> None:
     """The payload decodes back into the API struct and carries no legacy fields."""
-    worker = await _worker_with_boards(tmp_path, ["a"])
+    worker = await _worker_with_devices(tmp_path, ["a"])
     reading_at = datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
     stats = worker.stats["a"]
     stats.last_state = _sample_state()
@@ -257,7 +281,7 @@ async def test_msgpack_roundtrip_preserves_the_wire_contract(tmp_path) -> None:
 @pytest.mark.asyncio
 async def test_transconductance_is_rf_times_gain_when_both_known(tmp_path) -> None:
     """The derived transconductance is ``Rf * boost`` and unknown otherwise."""
-    worker = await _worker_with_boards(tmp_path, ["a"])
+    worker = await _worker_with_devices(tmp_path, ["a"])
     stats = worker.stats["a"]
 
     stats.last_state = _sample_state(feedback_resistor_ohm=1_000_000.0, boost_gain=10.0)

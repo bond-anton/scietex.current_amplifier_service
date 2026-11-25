@@ -25,9 +25,8 @@ from scietex.hal.current_amplifier.base.protocol import CurrentAmplifierProtocol
 from scietex.service.task_handler import TaskCapabilities, TaskData, TaskHandlerContext
 
 from scietex.current_amplifier_service.config import (
-    AmplifierSerialSettings,
-    AmplifierSettings,
-    AmplifierTcpSettings,
+    AmplifierDeviceSettings,
+    AmplifierTransportSettings,
     CurrentAmplifierServiceSettings,
 )
 
@@ -272,60 +271,49 @@ class _FakeTcpAmplifier(_FakeAmplifier):
         self.retries = retries
 
 
-def make_amplifier_settings(
-    label: str = "photodiode_a",
+def make_serial_transport(port: str = "/dev/ttyUSB0", **overrides: object) -> AmplifierTransportSettings:
+    """Build a valid RS485 transport; the defaults are the plugin's EBIC ones."""
+    return AmplifierTransportSettings(port=port, **overrides)
+
+
+def make_tcp_transport(host: str = "127.0.0.1", **overrides: object) -> AmplifierTransportSettings:
+    """Build a valid Modbus/TCP transport pointing at a gateway."""
+    return AmplifierTransportSettings(kind="tcp", host=host, **overrides)
+
+
+def make_device_settings(
     *,
-    port: str = "/dev/ttyUSB0",
     driver: str = FAKE_DRIVER_NAME,
-    address: int = 2,
+    address: int = 1,
+    label: str | None = None,
+    poll: bool = True,
     poll_interval: float = 1.0,
     relay_settle_s: float | None = None,
-    serial: AmplifierSerialSettings | None = None,
-) -> AmplifierSettings:
-    """Build valid RS485 board settings; the serial defaults are the EBIC firmware's."""
-    return AmplifierSettings(
-        label=label,
-        serial=serial if serial is not None else AmplifierSerialSettings(port=port),
+) -> AmplifierDeviceSettings:
+    """Build one device entry; the address defaults to the plugin's value."""
+    return AmplifierDeviceSettings(
         driver=driver,
         address=address,
-        poll_interval=poll_interval,
-        relay_settle_s=relay_settle_s,
-    )
-
-
-def make_tcp_amplifier_settings(
-    label: str = "preamp_1",
-    *,
-    host: str = "127.0.0.1",
-    port: int = 502,
-    address: int = 3,
-    timeout: float = 6.0,
-    retries: int = 0,
-    poll_interval: float = 1.0,
-    relay_settle_s: float | None = None,
-    driver: str = FAKE_TCP_DRIVER_NAME,
-) -> AmplifierSettings:
-    """Build valid Modbus/TCP board settings pointing at a gateway endpoint."""
-    return AmplifierSettings(
         label=label,
-        tcp=AmplifierTcpSettings(host=host, port=port, timeout=timeout, retries=retries),
-        transport="tcp",
-        driver=driver,
-        address=address,
+        poll=poll,
         poll_interval=poll_interval,
         relay_settle_s=relay_settle_s,
     )
 
 
 def make_settings(
-    amplifiers: list[AmplifierSettings] | None = None,
+    devices: dict[str, AmplifierDeviceSettings] | None = None,
     *,
+    transport: AmplifierTransportSettings | None = None,
+    poll_enabled: bool = True,
     failure_threshold: int = 3,
     stream_maxlen: int = 10000,
 ) -> CurrentAmplifierServiceSettings:
-    """Build service settings around the given board list (empty by default)."""
+    """Build service settings around the given device map (empty by default)."""
     return CurrentAmplifierServiceSettings(
-        amplifiers=list(amplifiers) if amplifiers is not None else [],
+        transport=transport if transport is not None else make_serial_transport(),
+        devices=dict(devices) if devices is not None else {},
+        poll_enabled=poll_enabled,
         failure_threshold=failure_threshold,
         stream_maxlen=stream_maxlen,
     )

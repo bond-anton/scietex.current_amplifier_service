@@ -4,25 +4,26 @@ The worker pushes one ``msgspec`` msgpack snapshot per instance to
 ``scietex:{service}:{instance_id}:telemetry`` every 2 s with a 6 s TTL, so a
 single missed beat does not expire the key. The API reads it with its own
 ``CurrentAmplifierServiceTelemetry`` struct: the service fields and the
-``devices`` map keyed by board label are the wire contract, and unknown fields
-are tolerated by that decoder. The per-board entry therefore also carries the
-producer-only ``reading_count``, ``error_count``, ``transconductance_v_per_a``
-and ``transport`` extras.
+``devices`` map keyed by the worker device id are the wire contract, and unknown
+fields are tolerated by that decoder. The per-device entry therefore also
+carries the producer-only ``reading_count``, ``error_count``,
+``transconductance_v_per_a`` and ``transport`` extras, plus the display
+``label`` when one is configured.
 
-Every measurement is taken from the board's last `AmplifierState` and stays
+Every measurement is taken from the device's last `AmplifierState` and stays
 ``None`` when the driver has never produced it, matching the HAL's "unknown is
 not zero" rule. ``preamp_range`` and ``feedback_resistor_ohm`` carry the same
 value (the selected Rf in ohm) so both the older and the newer consumer spelling
 decode. Filters are encoded as a list of structs, not a JSON string.
 
 State derivation is deliberately coarse, because the API renders one badge per
-board and one for the service:
+device and one for the service:
 
 * device ``"error"`` when the latest poll failed (``consecutive_failures > 0``),
   else ``"monitoring"`` when a poll task is scheduled, else ``"ok"`` when the
-  board is connected and has produced a reading, else ``"idle"``.
-* service ``"running"`` when any board is monitoring, else ``"idle"`` when
-  boards are configured, else ``"unconfigured"``.
+  device is connected and has produced a reading, else ``"idle"``.
+* service ``"running"`` when any device is monitoring, else ``"idle"`` when
+  devices are configured, else ``"unconfigured"``.
 
 Precedence matters: a failing poll wins over the monitoring flag so a broken
 board never shows as healthy, and a scheduled poll wins over a stale reading so
@@ -42,7 +43,7 @@ if TYPE_CHECKING:
     from scietex.hal.current_amplifier.base.protocol import CurrentAmplifierProtocol
 
     from .amplifier_worker import AmplifierStats, CurrentAmplifierWorker
-    from .config import AmplifierSettings
+    from .config import AmplifierDeviceSettings
 
 #: Push cadence and key TTL: 2 s interval, 6 s TTL so a single missed beat does
 #: not expire the key.
@@ -54,18 +55,18 @@ SCHEMA_VERSION: int = 1
 
 
 class AmplifierTelemetry(msgspec.Struct, frozen=True):
-    """One board's decoded state, matching the API read struct field-for-field.
+    """One device's decoded state, matching the API read struct field-for-field.
 
     Field order mirrors ``CurrentAmplifierDeviceTelemetry``. ``reading_count``,
-    ``error_count``, ``transconductance_v_per_a`` and ``transport`` are
-    producer-only extras: the API decoder tolerates and ignores them.
+    ``error_count``, ``transconductance_v_per_a``, ``transport`` and ``label``
+    are producer-only extras: the API decoder tolerates and ignores them.
 
     Every measurement and setting is ``None`` when the driver could not produce
     it, which is how the HAL distinguishes "unknown" from ``0``/``False``.
 
     Args:
-        state: Derived board state (``error``, ``monitoring``, ``ok``, ``idle``).
-        driver: Entry point name the board was built from.
+        state: Derived device state (``error``, ``monitoring``, ``ok``, ``idle``).
+        driver: Entry point name the device was built from.
         connected: Whether the most recent reads succeeded.
         monitoring: Whether a poll task is currently scheduled.
         ts: UTC ISO-8601 timestamp of the last reading, or ``None``.
@@ -89,9 +90,8 @@ class AmplifierTelemetry(msgspec.Struct, frozen=True):
         reading_count: Successful reads since startup.
         error_count: Failed reads since startup.
         transconductance_v_per_a: ``Rf * gain`` when both are known.
-        transport: ``"rs485"`` for a board on its own serial port, ``"tcp"``
-            for a board behind a Modbus/TCP gateway, matching
-            ``amplifier:list``.
+        transport: The service-wide transport kind, ``"rs485"`` or ``"tcp"``.
+        label: Configured display label, or ``None``; the map key is the identity.
     """
 
     state: str
@@ -120,23 +120,25 @@ class AmplifierTelemetry(msgspec.Struct, frozen=True):
     error_count: int = 0
     transconductance_v_per_a: float | None = None
     transport: str = "rs485"
+    label: str | None = None
 
 
 class CurrentAmplifierServiceTelemetry(msgspec.Struct, frozen=True):
     """Service telemetry snapshot pushed by the worker.
 
-    ``devices`` is keyed by board label, which is also the ``{label}`` segment of
-    the readings-stream key. ``poll_enabled`` reports whether any board is
-    monitoring, so the API can tell a stopped service from a running one.
+    ``devices`` is keyed by the worker device id, matching the config mapping and
+    the ``{device}`` segment of the readings-stream key. ``poll_enabled`` reports
+    whether any device is monitoring, so the API can tell a stopped service from
+    a running one.
 
     Args:
         state: Derived service state (``running``, ``idle``, ``unconfigured``).
         service: Service name the worker runs as.
         instance_id: Worker instance identifier.
-        configured: Whether the board list is populated.
-        poll_enabled: Whether any board is currently monitoring.
+        configured: Whether the device map is populated.
+        poll_enabled: Whether any device is currently monitoring.
         timestamp: When the payload was built, as UTC ISO-8601.
-        devices: One entry per configured board, keyed and sorted by label.
+        devices: One entry per configured device, keyed and sorted by device id.
         schema_version: Payload schema revision.
     """
 
@@ -151,14 +153,16 @@ class CurrentAmplifierServiceTelemetry(msgspec.Struct, frozen=True):
 
 
 def build_telemetry(worker: CurrentAmplifierWorker) -> CurrentAmplifierServiceTelemetry:
-    """Snapshot the worker's board registry into a telemetry payload.
+    """Snapshot the worker's device registry into a telemetry payload.
 
-    An unconfigured worker (empty board list) reports ``configured=False`` and
-    ``state="unconfigured"``. A configured worker reports one entry per board,
-    sorted by label, and derives the service state from the poll flags.
+    An unconfigured worker (empty device map) reports ``configured=False`` and
+    ``state="unconfigured"``. A configured worker reports one entry per device,
+    sorted by device id, and derives the service state from the poll flags.
     """
     configured = bool(worker.amplifier_settings)
     monitoring = any(worker.monitoring.values())
+    settings = worker.settings
+    transport = settings.transport.kind if settings is not None else "rs485"
     return CurrentAmplifierServiceTelemetry(
         state=_service_state(configured, monitoring),
         service=worker.service_name,
@@ -167,8 +171,8 @@ def build_telemetry(worker: CurrentAmplifierWorker) -> CurrentAmplifierServiceTe
         poll_enabled=monitoring,
         timestamp=datetime.now(timezone.utc).isoformat(),
         devices={
-            label: _amplifier_telemetry(worker, label, settings)
-            for label, settings in sorted(worker.amplifier_settings.items())
+            device: _amplifier_telemetry(worker, device, device_settings, transport)
+            for device, device_settings in sorted(worker.amplifier_settings.items())
         },
     )
 
@@ -198,12 +202,14 @@ def _device_state(stats: AmplifierStats, monitoring: bool, connected: bool) -> s
     return "idle"
 
 
-def _amplifier_telemetry(worker: CurrentAmplifierWorker, label: str, settings: AmplifierSettings) -> AmplifierTelemetry:
-    """Build one board's telemetry entry from its stats and last state."""
-    stats = worker.stats[label]
+def _amplifier_telemetry(
+    worker: CurrentAmplifierWorker, device: str, settings: AmplifierDeviceSettings, transport: str
+) -> AmplifierTelemetry:
+    """Build one device's telemetry entry from its stats and last state."""
+    stats = worker.stats[device]
     state = stats.last_state
-    monitoring = worker.monitoring.get(label, False)
-    connected = worker.connected.get(label, False)
+    monitoring = worker.monitoring.get(device, False)
+    connected = worker.connected.get(device, False)
     # Only successful reads are timestamped, so the last reading and the last
     # successful reading are the same event in this worker.
     last_ok = stats.last_reading_at.isoformat() if stats.last_reading_at is not None else None
@@ -232,8 +238,9 @@ def _amplifier_telemetry(worker: CurrentAmplifierWorker, label: str, settings: A
         last_ok=last_ok,
         reading_count=stats.reading_count,
         error_count=stats.error_count,
-        transconductance_v_per_a=_transconductance(worker.amplifiers.get(label), state),
-        transport=settings.transport,
+        transconductance_v_per_a=_transconductance(worker.amplifiers.get(device), state),
+        transport=transport,
+        label=settings.label,
     )
 
 

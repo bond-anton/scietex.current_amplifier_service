@@ -1,12 +1,12 @@
 """``amplifier:*`` data-plane tasks: read and control a single current amplifier.
 
-Each task targets one board by label. Write tasks are gated on the board's
-declared capability set before dispatch: an unsupported command is answered with
-``UNSUPPORTED`` instead of reaching a driver method that may fall back to the
-protocol's ``NotImplementedError`` stub. Several EBIC v1.0 writes are exactly
-that kind of stub while the capability tree still advertises the field, so the
-capability check is the gate and a driver ``NotImplementedError`` is only a
-second line of defence.
+Each task targets one device by the worker device id. Write tasks are gated on
+the board's declared capability set before dispatch: an unsupported command is
+answered with ``UNSUPPORTED`` instead of reaching a driver method that may fall
+back to the protocol's ``NotImplementedError`` stub. Several EBIC v1.0 writes are
+exactly that kind of stub while the capability tree still advertises the field,
+so the capability check is the gate and a driver ``NotImplementedError`` is only
+a second line of defence.
 
 Boost-gain safety: switching gain engages the new relay before releasing the old
 one, so a ``10x <-> 30x`` change passes through about ``39x`` for the relay
@@ -40,7 +40,7 @@ if TYPE_CHECKING:
     from scietex.hal.current_amplifier.base.protocol import CurrentAmplifierProtocol
 
     from ..amplifier_worker import CurrentAmplifierWorker
-    from ..config import AmplifierSettings
+    from ..config import AmplifierTransportSettings
 
 #: Task name that lists the configured boards and their control surface.
 AMPLIFIER_LIST_TASK_NAME = "amplifier:list"
@@ -99,11 +99,11 @@ class AmplifierStatusRequest(msgspec.Struct, frozen=True, forbid_unknown_fields=
     """Request payload for ``amplifier:status``.
 
     Args:
-        label: Board to report; ``None`` (or an empty payload) reports every
-            configured board.
+        device: Worker device id to report; ``None`` (or an empty payload)
+            reports every configured device.
     """
 
-    label: str | None = None
+    device: str | None = None
 
 
 class AmplifierCommandRequest(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
@@ -114,7 +114,7 @@ class AmplifierCommandRequest(msgspec.Struct, frozen=True, forbid_unknown_fields
     the wire surface flat — the task name already says which fields apply.
 
     Args:
-        label: Board label to target (required).
+        device: Worker device id to target (required).
         resistance_ohm: Feedback resistor for ``amplifier:set-feedback-resistor``.
         gain: Boost gain for ``amplifier:set-boost-gain``.
         enabled: Switch state for the enable/disable tasks and the filter.
@@ -127,7 +127,7 @@ class AmplifierCommandRequest(msgspec.Struct, frozen=True, forbid_unknown_fields
         inverted: Output-polarity state for ``amplifier:set-inverted``.
     """
 
-    label: str
+    device: str
     resistance_ohm: float | None = None
     gain: float | None = None
     enabled: bool | None = None
@@ -175,22 +175,23 @@ class AmplifierControlSummary(msgspec.Struct, frozen=True):
 
 
 class AmplifierInfo(msgspec.Struct, frozen=True):
-    """One board's registry entry and control surface.
+    """One device's registry entry and control surface.
 
     Args:
-        label: Unique board label and stream-key segment.
-        driver: Entry point name the board was built from.
+        device: Worker device id and stream-key segment.
+        driver: Entry point name the device was built from.
         address: Modbus slave address.
-        port: Configured endpoint: the serial device for an RS485 board, or
-            ``host:port`` for a Modbus/TCP board.
+        port: Configured endpoint: the serial device for an RS485 segment, or
+            ``host:port`` for a Modbus/TCP gateway.
         monitoring: Whether a poll task is currently scheduled.
         connected: Whether the most recent reads succeeded.
-        controls: What the board accepts.
-        transport: ``"rs485"`` for a board on its own serial port,
-            ``"tcp"`` for a board behind a Modbus/TCP gateway.
+        controls: What the device accepts.
+        transport: The service-wide transport kind, ``"rs485"`` or ``"tcp"``.
+        label: Configured display label, or ``None``. Display only: the identity
+            is ``device``.
     """
 
-    label: str
+    device: str
     driver: str
     address: int
     port: str
@@ -198,6 +199,7 @@ class AmplifierInfo(msgspec.Struct, frozen=True):
     connected: bool
     controls: AmplifierControlSummary
     transport: str = "rs485"
+    label: str | None = None
 
 
 class AmplifierListResponse(msgspec.Struct, frozen=True):
@@ -206,7 +208,7 @@ class AmplifierListResponse(msgspec.Struct, frozen=True):
     Args:
         service: Service name the worker runs as.
         instance_id: Worker instance identifier.
-        amplifiers: Configured boards, sorted by label.
+        amplifiers: Configured devices, sorted by device id.
     """
 
     service: str
@@ -215,10 +217,10 @@ class AmplifierListResponse(msgspec.Struct, frozen=True):
 
 
 class AmplifierStatus(msgspec.Struct, frozen=True):
-    """Cached poll status of one board.
+    """Cached poll status of one device.
 
     Args:
-        label: Board label.
+        device: Worker device id.
         connected: Whether the most recent reads succeeded.
         monitoring: Whether a poll task is currently scheduled.
         reading_count: Successful reads since startup.
@@ -230,7 +232,7 @@ class AmplifierStatus(msgspec.Struct, frozen=True):
         state: Last known state snapshot, or ``None`` before the first read.
     """
 
-    label: str
+    device: str
     connected: bool
     monitoring: bool
     reading_count: int
@@ -245,8 +247,8 @@ class AmplifierStatusResponse(msgspec.Struct, frozen=True):
     """Result payload of ``amplifier:status``.
 
     Args:
-        amplifiers: One entry per requested board, sorted by label unless a
-            single label was requested.
+        amplifiers: One entry per requested device, sorted by device id unless a
+            single device was requested.
     """
 
     amplifiers: list[AmplifierStatus]
@@ -256,7 +258,7 @@ class AmplifierCommandResponse(msgspec.Struct, frozen=True):
     """Result payload of ``amplifier:read`` and the ``amplifier:set-*`` tasks.
 
     Args:
-        label: Board the command targeted.
+        device: Worker device id the command targeted.
         task: Task name that ran.
         applied: Values the command wrote, echoed in request spelling.
         state: State snapshot read back after the command; present for
@@ -266,7 +268,7 @@ class AmplifierCommandResponse(msgspec.Struct, frozen=True):
             otherwise.
     """
 
-    label: str
+    device: str
     task: str
     applied: dict[str, Any] = msgspec.field(default_factory=dict)
     state: dict[str, Any] | None = None
@@ -284,12 +286,12 @@ class AmplifierCommandError(msgspec.Struct, frozen=True):
     direct callers and repeats that verdict.
 
     Args:
-        label: Board the command targeted.
+        device: Worker device id the command targeted.
         task: Task name that failed.
         outcome_unknown: Whether the write may have landed despite the failure.
     """
 
-    label: str
+    device: str
     task: str
     outcome_unknown: bool = False
 
@@ -487,7 +489,7 @@ def _exception_chain(exc: BaseException) -> tuple[BaseException, ...]:
     return tuple(links)
 
 
-def _command_failure(task: str, label: str, exc: Exception, *, stage: Literal["read", "write"]) -> _Failure:
+def _command_failure(task: str, device: str, exc: Exception, *, stage: Literal["read", "write"]) -> _Failure:
     """Classify an exception raised by the driver while executing ``task``.
 
     A ``NotImplementedError`` means the driver stub was reached despite a truthy
@@ -538,7 +540,7 @@ def _command_failure(task: str, label: str, exc: Exception, *, stage: Literal["r
         # Modbus taxonomy) may have been raised after the request left the host.
         # Only 0x06 proves non-execution, so report the ambiguity rather than
         # invite a replay.
-        detail = AmplifierCommandError(label=label, task=task, outcome_unknown=True)
+        detail = AmplifierCommandError(device=device, task=task, outcome_unknown=True)
         return _Failure(
             _command_result(
                 f"{message} (write outcome unknown; do not retry)",
@@ -565,17 +567,18 @@ def _host_port(host: str, port: int) -> str:
     return f"{host}:{port}"
 
 
-def _endpoint(settings: AmplifierSettings) -> str:
-    """Render a board's configured endpoint for the list payload.
+def _endpoint(transport: AmplifierTransportSettings) -> str:
+    """Render the configured endpoint for the list payload.
 
-    An RS485 board reports its serial device. A TCP board reports the gateway as
-    ``host:port``: that is the connection the board is reached through, while
-    its Modbus address distinguishes boards sharing one gateway.
+    An ``rs485`` segment reports its serial device. A ``tcp`` segment reports the
+    gateway as ``host:tcp_port``: that is the connection every device on the
+    segment is reached through, while each device's Modbus address distinguishes
+    them. The transport is service-wide, so every entry renders the same
+    endpoint.
     """
-    if settings.transport == "tcp":
-        tcp = settings.tcp_block()
-        return _host_port(tcp.host, tcp.port)
-    return settings.serial_block().port
+    if transport.kind == "tcp":
+        return _host_port(cast(str, transport.host), transport.tcp_port)
+    return cast(str, transport.port)
 
 
 async def _apply_feedback_resistor(amplifier: CurrentAmplifierProtocol, request: AmplifierCommandRequest) -> None:
@@ -757,9 +760,9 @@ class AmplifierControlHandler(TaskHandler):
         ]
 
     async def handle(self, task_data: TaskData, *, capabilities: TaskCapabilities) -> TaskResult:
-        """Execute one ``amplifier:*`` command against the labelled board.
+        """Execute one ``amplifier:*`` command against the targeted device.
 
-        Checks, in order: payload decode, board lookup, capability gate,
+        Checks, in order: payload decode, device lookup, capability gate,
         parameter presence and domain, then dispatch. A write exception is
         classified by `_command_failure`; a failed read-back after a write that
         landed is reported on the successful result, never as a retryable error.
@@ -775,15 +778,15 @@ class AmplifierControlHandler(TaskHandler):
         except msgspec.DecodeError as exc:
             return TaskResult(status="error", error=str(exc), error_code="INVALID_PAYLOAD", retryable=False)
 
-        label = request.label
-        amplifier = self._worker.amplifiers.get(label)
+        device = request.device
+        amplifier = self._worker.amplifiers.get(device)
         if amplifier is None:
             return TaskResult(
-                status="error", error=f"Unknown amplifier label {label!r}", error_code="UNKNOWN_AMPLIFIER", retryable=False
+                status="error", error=f"Unknown amplifier device {device!r}", error_code="UNKNOWN_AMPLIFIER", retryable=False
             )
 
         if task == AMPLIFIER_READ_TASK_NAME:
-            return await self._read(task, label, amplifier)
+            return await self._read(task, device, amplifier)
 
         command = _COMMAND_BY_TASK[task]
         unsupported_gate = next(
@@ -793,7 +796,7 @@ class AmplifierControlHandler(TaskHandler):
         if unsupported_gate is not None:
             return TaskResult(
                 status="error",
-                error=f"Amplifier {label!r} does not support {task}",
+                error=f"Amplifier {device!r} does not support {task}",
                 error_code="UNSUPPORTED",
                 retryable=False,
             )
@@ -809,7 +812,7 @@ class AmplifierControlHandler(TaskHandler):
         try:
             await command.apply(amplifier, request)
         except Exception as exc:
-            return self._fail(label, _command_failure(task, label, exc, stage="write"))
+            return self._fail(device, _command_failure(task, device, exc, stage="write"))
 
         state: AmplifierState | None = None
         readback_error: str | None = None
@@ -824,12 +827,12 @@ class AmplifierControlHandler(TaskHandler):
                 self.logger.warning(
                     "%s on amplifier %r wrote successfully but the read-back failed: %s",
                     task,
-                    label,
+                    device,
                     readback_error,
                 )
 
         response = AmplifierCommandResponse(
-            label=label,
+            device=device,
             task=task,
             applied={field: value for field in command.echo if (value := getattr(request, field)) is not None},
             state=_state_dict(state) if state is not None else None,
@@ -838,8 +841,8 @@ class AmplifierControlHandler(TaskHandler):
         return TaskResult(status="success", payload=msgspec.json.encode(response))
 
     def _list_amplifiers(self) -> TaskResult:
-        """Report the registry and each board's control surface."""
-        amplifiers = [self._info(label, amplifier) for label, amplifier in sorted(self._worker.amplifiers.items())]
+        """Report the registry and each device's control surface."""
+        amplifiers = [self._info(device, amplifier) for device, amplifier in sorted(self._worker.amplifiers.items())]
         response = AmplifierListResponse(
             service=self._worker.service_name,
             instance_id=self._worker.instance_id,
@@ -847,28 +850,31 @@ class AmplifierControlHandler(TaskHandler):
         )
         return TaskResult(status="success", payload=msgspec.json.encode(response))
 
-    def _info(self, label: str, amplifier: CurrentAmplifierProtocol) -> AmplifierInfo:
+    def _info(self, device: str, amplifier: CurrentAmplifierProtocol) -> AmplifierInfo:
         """Build one list entry from the registry and its settings."""
-        settings = self._worker.amplifier_settings[label]
+        device_settings = self._worker.amplifier_settings[device]
+        service_settings = self._worker.settings
+        transport = service_settings.transport if service_settings is not None else None
         return AmplifierInfo(
-            label=label,
-            driver=settings.driver,
-            address=settings.address,
-            port=_endpoint(settings),
-            monitoring=self._worker.monitoring.get(label, False),
-            connected=self._worker.connected.get(label, False),
+            device=device,
+            driver=device_settings.driver,
+            address=device_settings.address,
+            port=_endpoint(transport) if transport is not None else "",
+            monitoring=self._worker.monitoring.get(device, False),
+            connected=self._worker.connected.get(device, False),
             controls=_control_summary(amplifier),
-            transport=settings.transport,
+            transport=transport.kind if transport is not None else "rs485",
+            label=device_settings.label,
         )
 
-    def _fail(self, label: str, failure: _Failure) -> TaskResult:
-        """Return a classified failure, marking the board unhealthy when proven."""
+    def _fail(self, device: str, failure: _Failure) -> TaskResult:
+        """Return a classified failure, marking the device unhealthy when proven."""
         if failure.unhealthy:
-            self._worker.connected[label] = False
+            self._worker.connected[device] = False
         return failure.result
 
     def _status(self, task_data: TaskData) -> TaskResult:
-        """Report cached status for one board or every board."""
+        """Report cached status for one device or every device."""
         if task_data.payload:
             try:
                 request = msgspec.json.decode(task_data.payload, type=AmplifierStatusRequest)
@@ -877,29 +883,29 @@ class AmplifierControlHandler(TaskHandler):
         else:
             request = AmplifierStatusRequest()
 
-        if request.label is not None:
-            if request.label not in self._worker.amplifiers:
+        if request.device is not None:
+            if request.device not in self._worker.amplifiers:
                 return TaskResult(
                     status="error",
-                    error=f"Unknown amplifier label {request.label!r}",
+                    error=f"Unknown amplifier device {request.device!r}",
                     error_code="UNKNOWN_AMPLIFIER",
                     retryable=False,
                 )
-            labels = [request.label]
+            devices = [request.device]
         else:
-            labels = sorted(self._worker.amplifiers)
+            devices = sorted(self._worker.amplifiers)
 
-        response = AmplifierStatusResponse(amplifiers=[self._status_entry(label) for label in labels])
+        response = AmplifierStatusResponse(amplifiers=[self._status_entry(device) for device in devices])
         return TaskResult(status="success", payload=msgspec.json.encode(response))
 
-    def _status_entry(self, label: str) -> AmplifierStatus:
+    def _status_entry(self, device: str) -> AmplifierStatus:
         """Build one status entry from the poll counters and last good snapshot."""
-        stats = self._worker.stats[label]
+        stats = self._worker.stats[device]
         last_reading_at = stats.last_reading_at
         return AmplifierStatus(
-            label=label,
-            connected=self._worker.connected.get(label, False),
-            monitoring=self._worker.monitoring.get(label, False),
+            device=device,
+            connected=self._worker.connected.get(device, False),
+            monitoring=self._worker.monitoring.get(device, False),
             reading_count=stats.reading_count,
             error_count=stats.error_count,
             consecutive_failures=stats.consecutive_failures,
@@ -908,11 +914,11 @@ class AmplifierControlHandler(TaskHandler):
             state=_state_dict(stats.last_state) if stats.last_state is not None else None,
         )
 
-    async def _read(self, task: str, label: str, amplifier: CurrentAmplifierProtocol) -> TaskResult:
-        """Read the live state of one board."""
+    async def _read(self, task: str, device: str, amplifier: CurrentAmplifierProtocol) -> TaskResult:
+        """Read the live state of one device."""
         try:
             state = await amplifier.read_data()
         except Exception as exc:
-            return self._fail(label, _command_failure(task, label, exc, stage="read"))
-        response = AmplifierCommandResponse(label=label, task=task, state=_state_dict(state))
+            return self._fail(device, _command_failure(task, device, exc, stage="read"))
+        response = AmplifierCommandResponse(device=device, task=task, state=_state_dict(state))
         return TaskResult(status="success", payload=msgspec.json.encode(response))

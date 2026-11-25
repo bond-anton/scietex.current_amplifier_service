@@ -2,16 +2,16 @@
 current amplifier boards.
 
 `CurrentAmplifierWorker` extends `ValkeyWorker` and drives one or more EBIC
-v1.0 current-amplifier boards, each over its own RS485 segment or through a
-Modbus/TCP gateway. A board is driven by a
+v1.0 current-amplifier boards behind a single service-wide transport: one RS485
+segment or one Modbus/TCP gateway. A board is driven by a
 `scietex.hal.current_amplifier` class selected by entry point name;
-the worker seeds its in-memory board registry from the service-owned
+the worker seeds its in-memory device registry from the service-owned
 ``current_amplifier.yml`` at startup and reconciles it against the framework's
 merged remote-config section (the L3 ``current_amplifier`` section replaces the
-YAML list wholesale, it is never merged by label). A ``Telemetry`` manager
-publishes a service snapshot every 2 s so the UI can observe the configured/live
-state, and one long-lived poll task per board publishes readings to a per-board
-Valkey stream.
+YAML device map wholesale, it is never merged by device id). A ``Telemetry``
+manager publishes a service snapshot every 2 s so the UI can observe the
+configured/live state, and one long-lived poll task per polled device publishes
+readings to a per-device Valkey stream.
 
 Unlike `scietex.vfd_service.vfd_worker`, this worker has no persistent transport
 to open: the EBIC driver connects the serial port or the TCP gateway once per
@@ -45,7 +45,8 @@ from scietex.service.valkey._glide import StreamAddOptions, TrimByMaxLen
 from .config import (
     CURRENT_AMPLIFIER_SECTION,
     CURRENT_AMPLIFIER_SETTINGS_DEFAULTS,
-    AmplifierSettings,
+    AmplifierDeviceSettings,
+    AmplifierTransportSettings,
     CurrentAmplifierServiceSettings,
     read_current_amplifier_config,
     transport_for_driver,
@@ -135,10 +136,10 @@ class CurrentAmplifierWorker(ValkeyWorker):
     ``bootstrap=None``, so L1 never enters the framework's layer stack; the
     worker reads the YAML itself to seed the initial registry and then
     reconciles against the merged section after ``super().initialize()``. The
-    merged ``amplifiers`` list replaces the YAML list entirely — it is not
-    merged by label.
+    merged ``devices`` map replaces the YAML map entirely — it is not merged by
+    device id.
 
-    A board is polled by one long-lived task; it is never connected during
+    A device is polled by one long-lived task; it is never connected during
     startup, so an offline board does not block the service. A reconfig at
     runtime is restart-required (the registry is not live-rebuilt).
     """
@@ -147,7 +148,7 @@ class CurrentAmplifierWorker(ValkeyWorker):
         super().__init__(config, client_factory=client_factory, theme=theme)
         self._settings: CurrentAmplifierServiceSettings | None = None
         self._amplifiers: dict[str, CurrentAmplifierProtocol] = {}
-        self._amplifier_settings: dict[str, AmplifierSettings] = {}
+        self._amplifier_settings: dict[str, AmplifierDeviceSettings] = {}
         self._monitoring: dict[str, bool] = {}
         self._poll_tasks: dict[str, asyncio.Task[None]] = {}
         self._connected: dict[str, bool] = {}
@@ -182,7 +183,7 @@ class CurrentAmplifierWorker(ValkeyWorker):
 
     @property
     def amplifiers(self) -> dict[str, CurrentAmplifierProtocol]:
-        """The live board registry keyed by label (the dict itself, not a copy).
+        """The live board registry keyed by device id (the dict itself, not a copy).
 
         Mutating callers share the worker's registry; read-only consumers should
         iterate without changing it.
@@ -190,29 +191,38 @@ class CurrentAmplifierWorker(ValkeyWorker):
         return self._amplifiers
 
     @property
-    def amplifier_settings(self) -> dict[str, AmplifierSettings]:
-        """The per-label board settings the registry was built from."""
+    def amplifier_settings(self) -> dict[str, AmplifierDeviceSettings]:
+        """The per-device settings the registry was built from, keyed by device id."""
         return self._amplifier_settings
 
     @property
     def monitoring(self) -> dict[str, bool]:
-        """Per-label poll-loop activity: True while a poll task is scheduled."""
+        """Per-device poll-loop activity: True while a poll task is scheduled."""
         return self._monitoring
 
     @property
     def connected(self) -> dict[str, bool]:
-        """Per-label read state tracked by the poll loop."""
+        """Per-device read state tracked by the poll loop."""
         return self._connected
 
     @property
     def stats(self) -> dict[str, AmplifierStats]:
-        """Per-label counters accumulated by the poll loop."""
+        """Per-device counters accumulated by the poll loop."""
         return self._stats
 
     @property
     def restart_required(self) -> bool:
         """Whether a post-startup settings apply requires a restart to rebuild the registry."""
         return self._restart_required
+
+    @property
+    def settings(self) -> CurrentAmplifierServiceSettings | None:
+        """The effective service settings, or `None` before the first apply.
+
+        The transport is service-wide, so consumers that render an endpoint or a
+        transport kind read it from here rather than from per-device settings.
+        """
+        return self._settings
 
     def _failure_threshold(self) -> int:
         """Consecutive failed reads before a board is reported as disconnected.
@@ -268,8 +278,8 @@ class CurrentAmplifierWorker(ValkeyWorker):
         if resolved is not None:
             resolved_settings = cast(CurrentAmplifierServiceSettings, resolved)
             if resolved_settings != settings:
-                # L3 wins wholesale: the merged ``amplifiers`` list replaces the
-                # YAML-seeded list entirely, it is not merged by label.
+                # L3 wins wholesale: the merged ``devices`` map replaces the
+                # YAML-seeded map entirely, it is not merged by device id.
                 self._apply_settings(resolved_settings)
                 try:
                     await self._build_amplifiers(resolved_settings)
@@ -278,7 +288,7 @@ class CurrentAmplifierWorker(ValkeyWorker):
                     return False
 
         self._startup_complete = True
-        self.logger.info("Current amplifier service started: %d board(s)", len(self._amplifiers))
+        self.logger.info("Current amplifier service started: %d device(s)", len(self._amplifiers))
         return True
 
     async def cleanup(self) -> None:
@@ -292,16 +302,16 @@ class CurrentAmplifierWorker(ValkeyWorker):
         Idempotent: existing poll tasks are cancelled and existing boards closed
         before the registry is rebuilt. A board is instantiated but not
         connected here — the driver opens its connection per read operation, so
-        an offline board does not block startup.
+        an offline board does not block startup. Every registry dict is keyed by
+        the device id, which is also the readings-stream key segment.
 
         Args:
             settings: The authoritative settings to build from.
 
         Raises:
-            ValueError: On a duplicate label, a driver whose family contradicts
-                the board's transport, invalid serial settings, an unresolvable
-                driver, or an instance that does not satisfy
-                `CurrentAmplifierProtocol`.
+            ValueError: On a driver whose family contradicts the transport,
+                invalid serial settings, an unresolvable driver, or an instance
+                that does not satisfy `CurrentAmplifierProtocol`.
         """
         await self.close_amplifiers()
         # The registry is built from these settings, so they are the effective
@@ -314,112 +324,136 @@ class CurrentAmplifierWorker(ValkeyWorker):
         self._connected = {}
         self._stats = {}
 
-        seen: set[str] = set()
-        for board_settings in settings.amplifiers:
-            label = board_settings.label
-            if label in seen:
-                self.logger.error("Duplicate amplifier label %r in configuration", label)
-                raise ValueError(f"Duplicate amplifier label {label!r}")
-            seen.add(label)
-
-            driver = resolve_driver(board_settings.driver)
+        for device_id, device in settings.devices.items():
+            driver = resolve_driver(device.driver)
             # The transport decides the constructor shape: the serial driver takes
             # a connection config, the TCP driver takes the gateway endpoint. The
             # driver family is re-checked against the transport here, before any
             # instance is created, so a settings object built outside the
-            # validated config path cannot put a TCP driver on a serial board.
-            kwargs = self._driver_kwargs(board_settings)
+            # validated config path cannot put a TCP driver on a serial segment.
+            kwargs = self._driver_kwargs(device_id, device, settings.transport)
             # Only pass the settle delay when configured and when the driver
             # takes it: a driver that declares no such parameter would raise
             # TypeError on construction.
-            if board_settings.relay_settle_s is not None:
+            if device.relay_settle_s is not None:
                 if _accepts_keyword(driver, "relay_settle_s"):
-                    kwargs["relay_settle_s"] = board_settings.relay_settle_s
+                    kwargs["relay_settle_s"] = device.relay_settle_s
                 else:
                     self.logger.warning(
                         "Driver %r for amplifier %r does not accept relay_settle_s; "
                         "the configured %s s is ignored and the driver keeps its own default.",
-                        board_settings.driver,
-                        label,
-                        board_settings.relay_settle_s,
+                        device.driver,
+                        device_id,
+                        device.relay_settle_s,
                     )
             amplifier = cast(Any, driver)(**kwargs)
             if not isinstance(amplifier, CurrentAmplifierProtocol):
                 self.logger.error(
                     "Driver %r for amplifier %r is not a CurrentAmplifierProtocol",
-                    board_settings.driver,
-                    label,
+                    device.driver,
+                    device_id,
                 )
-                raise ValueError(f"Driver {board_settings.driver!r} for amplifier {label!r} is not a CurrentAmplifierProtocol")
+                raise ValueError(f"Driver {device.driver!r} for amplifier {device_id!r} is not a CurrentAmplifierProtocol")
 
-            self._amplifiers[label] = amplifier
-            self._amplifier_settings[label] = board_settings
-            self._monitoring[label] = False
-            self._connected[label] = False
-            self._stats[label] = AmplifierStats()
+            self._amplifiers[device_id] = amplifier
+            self._amplifier_settings[device_id] = device
+            self._monitoring[device_id] = False
+            self._connected[device_id] = False
+            self._stats[device_id] = AmplifierStats()
 
-    def _driver_kwargs(self, board_settings: AmplifierSettings) -> dict[str, Any]:
-        """Build one board's driver constructor keyword arguments.
+    def _driver_kwargs(
+        self, device_id: str, device: AmplifierDeviceSettings, transport: AmplifierTransportSettings
+    ) -> dict[str, Any]:
+        """Build one device's driver constructor keyword arguments.
 
-        The transport decides the shape: an RS485 board passes its serial
-        connection config as ``con_params``, a TCP board passes the gateway
-        ``host``/``port`` plus ``timeout``/``retries``. The driver family is
-        checked against the transport first, so a mismatch fails before any
-        driver is instantiated.
+        The service-wide transport decides the shape: an ``rs485`` segment passes
+        one serial connection config as ``con_params``, a ``tcp`` gateway passes
+        ``host``/``tcp_port`` as ``port`` plus ``tcp_timeout``/``tcp_retries`` as
+        ``timeout``/``retries``. The driver family is checked against the
+        transport kind first, so a mismatch fails before any driver is
+        instantiated. The driver's ``label`` is logging-only, so a device without
+        one falls back to its id.
 
         Raises:
-            ValueError: If the driver family contradicts the transport, or if the
-                connection block for that transport is missing.
+            ValueError: If the driver family contradicts the transport kind, or
+                if the transport for that kind is incomplete.
         """
-        driver_transport = transport_for_driver(board_settings.driver)
-        if driver_transport is not None and driver_transport != board_settings.transport:
+        driver_transport = transport_for_driver(device.driver)
+        if driver_transport is not None and driver_transport != transport.kind:
             raise ValueError(
-                f"amplifier {board_settings.label!r}: driver {board_settings.driver!r} is a "
-                f"{driver_transport} driver but transport is {board_settings.transport!r}"
+                f"device {device_id!r}: driver {device.driver!r} is a {driver_transport} driver "
+                f"but transport kind is {transport.kind!r}"
             )
-        if board_settings.transport == "tcp":
-            tcp = board_settings.tcp_block()
+        label = device.label or device_id
+        if transport.kind == "tcp":
             return {
-                "host": tcp.host,
-                "port": tcp.port,
-                "address": board_settings.address,
-                "label": board_settings.label,
-                "timeout": tcp.timeout,
-                "retries": tcp.retries,
+                "host": transport.host,
+                "port": transport.tcp_port,
+                "address": device.address,
+                "label": label,
+                "timeout": transport.tcp_timeout,
+                "retries": transport.tcp_retries,
                 "logger": self.logger,
             }
         return {
-            "con_params": self._connection_config(board_settings),
-            "address": board_settings.address,
-            "label": board_settings.label,
+            "con_params": self._connection_config(device_id, transport),
+            "address": device.address,
+            "label": label,
             "logger": self.logger,
         }
 
-    def _connection_config(self, board_settings: AmplifierSettings) -> ModbusSerialConnectionConfig:
-        """Build the serial connection config for one board.
+    def _connection_config(self, device_id: str, transport: AmplifierTransportSettings) -> ModbusSerialConnectionConfig:
+        """Build the serial connection config for the service's RS485 segment.
 
         The serial model validates its own field domains (baud rate, parity,
         framer, stop bits) and raises `ValueError` for an unsupported value;
-        that error is re-raised with the board label so a bad config names the
-        board instead of failing anonymously. `AmplifierSerialSettings.stopbits`
-        is a float, while the serial model accepts only integer stop-bit counts
-        and rejects an integral float as the wrong type, so an integral value is
-        narrowed back to `int` first.
+        that error is re-raised with the device id so a bad config names the
+        device instead of failing anonymously. ``stopbits`` is a float, while the
+        serial model accepts only integer stop-bit counts and rejects an
+        integral float as the wrong type, so an integral value is narrowed back
+        to `int` first.
+
+        ``write_timeout``/``inter_byte_timeout`` are only forwarded when set.
+        The installed `scietex.hal.serial` may not carry them on its Modbus
+        config (this release accepts them as unused kwargs and drops them), so
+        the built config is checked field by field: a value the HAL could not
+        retain raises a `ValueError` naming the field instead of silently
+        configuring a timeout that never takes effect.
         """
-        serial = board_settings.serial_block()
-        stopbits = int(serial.stopbits) if float(serial.stopbits).is_integer() else serial.stopbits
+        stopbits = int(transport.stopbits) if float(transport.stopbits).is_integer() else transport.stopbits
+        optional: dict[str, float] = {}
+        if transport.write_timeout is not None:
+            optional["write_timeout"] = transport.write_timeout
+        if transport.inter_byte_timeout is not None:
+            optional["inter_byte_timeout"] = transport.inter_byte_timeout
         try:
-            return ModbusSerialConnectionConfig(
-                port=serial.port,
-                baudrate=serial.baudrate,
-                bytesize=serial.bytesize,
-                parity=serial.parity,
+            config = ModbusSerialConnectionConfig(
+                port=transport.port,
+                baudrate=transport.baudrate,
+                bytesize=transport.bytesize,
+                parity=transport.parity,
                 stopbits=stopbits,
-                timeout=serial.timeout,
-                framer=serial.framer,
+                timeout=transport.timeout,
+                framer=transport.framer,
+                **optional,
             )
+        except TypeError as exc:
+            field = next((name for name in optional if name in str(exc)), None)
+            if field is None:
+                raise ValueError(f"device {device_id!r}: invalid serial settings: {exc}") from exc
+            raise ValueError(
+                f"device {device_id!r}: the installed scietex.hal.serial does not accept transport.{field}: {exc}"
+            ) from exc
         except ValueError as exc:
-            raise ValueError(f"amplifier {board_settings.label!r}: invalid serial settings: {exc}") from exc
+            raise ValueError(f"device {device_id!r}: invalid serial settings: {exc}") from exc
+
+        for field, value in optional.items():
+            if getattr(config, field, None) != value:
+                raise ValueError(
+                    f"device {device_id!r}: the installed scietex.hal.serial does not honour "
+                    f"transport.{field} on its Modbus serial config"
+                )
+        return config
 
     async def close_amplifiers(self) -> None:
         """Cancel all poll tasks and close every board, swallowing close errors.
@@ -428,16 +462,16 @@ class CurrentAmplifierWorker(ValkeyWorker):
         ``_build_amplifiers``. A close error is logged and swallowed so a
         teardown failure never aborts shutdown or a rebuild.
         """
-        for label, task in list(self._poll_tasks.items()):
+        for device, task in list(self._poll_tasks.items()):
             task.cancel()
-            self._monitoring[label] = False
-            self._connected[label] = False
+            self._monitoring[device] = False
+            self._connected[device] = False
         self._poll_tasks.clear()
-        for label, amplifier in list(self._amplifiers.items()):
+        for device, amplifier in list(self._amplifiers.items()):
             try:
                 await amplifier.close()
             except Exception as exc:
-                self.logger.warning("Failed to close amplifier %r: %s", label, exc)
+                self.logger.warning("Failed to close amplifier %r: %s", device, exc)
 
     def _apply_settings(self, settings: CurrentAmplifierServiceSettings) -> None:
         """Apply merged current amplifier settings (sync hook, invoked inline).
@@ -458,26 +492,33 @@ class CurrentAmplifierWorker(ValkeyWorker):
         )
         self._restart_required = True
 
-    def _labels(self, label: str | None) -> list[str]:
-        """Resolve a label selector to the list of affected labels.
+    def _devices(self, device: str | None) -> list[str]:
+        """Resolve a device selector to the list of affected device ids.
 
-        ``None`` selects all boards; an unknown label raises `KeyError`.
+        ``None`` selects all devices; an unknown id raises `KeyError`.
         """
-        if label is None:
+        if device is None:
             return list(self._amplifiers)
-        if label not in self._amplifiers:
-            raise KeyError(f"Unknown amplifier label {label!r}")
-        return [label]
+        if device not in self._amplifiers:
+            raise KeyError(f"Unknown amplifier device {device!r}")
+        return [device]
 
-    def start_monitoring(self, label: str | None = None) -> list[str]:
-        """Start a poll task for the selected board(s), returning affected labels.
+    def start_monitoring(self, device: str | None = None) -> list[str]:
+        """Start a poll task for the selected device(s), returning affected ids.
 
-        ``label=None`` starts every board. A label that is already monitoring is
-        a no-op and is not returned. Each started board gets one long-lived poll
-        task scheduled on the running loop.
+        ``device=None`` starts every device that is in the poll plan. Nothing
+        starts when ``poll_enabled`` is false, and a device with ``poll=false``
+        is skipped — it stays readable on demand. A device that is already
+        monitoring is a no-op and is not returned. Each started device gets one
+        long-lived poll task scheduled on the running loop.
         """
+        settings = self._settings
+        if settings is not None and not settings.poll_enabled:
+            return []
         affected: list[str] = []
-        for candidate in self._labels(label):
+        for candidate in self._devices(device):
+            if not self._amplifier_settings[candidate].poll:
+                continue
             if self._monitoring[candidate]:
                 continue
             self._monitoring[candidate] = True
@@ -485,15 +526,15 @@ class CurrentAmplifierWorker(ValkeyWorker):
             affected.append(candidate)
         return affected
 
-    def stop_monitoring(self, label: str | None = None) -> list[str]:
-        """Cancel the poll task for the selected board(s), returning affected labels.
+    def stop_monitoring(self, device: str | None = None) -> list[str]:
+        """Cancel the poll task for the selected device(s), returning affected ids.
 
-        ``label=None`` stops every board. The task is cancelled (sync — the loop
-        is not awaited), removed from ``_poll_tasks``, and the label marked not
-        monitoring. Stopping a board that is not monitoring is a no-op.
+        ``device=None`` stops every device. The task is cancelled (sync — the
+        loop is not awaited), removed from ``_poll_tasks``, and the device marked
+        not monitoring. Stopping a device that is not monitoring is a no-op.
         """
         affected: list[str] = []
-        for candidate in self._labels(label):
+        for candidate in self._devices(device):
             task = self._poll_tasks.pop(candidate, None)
             if task is not None:
                 task.cancel()
@@ -507,14 +548,14 @@ class CurrentAmplifierWorker(ValkeyWorker):
         """Sleep for ``delay``; a separate method so tests can short-circuit the poll loop."""
         await asyncio.sleep(delay)
 
-    def _poll_delay(self, amplifier_settings: AmplifierSettings, stats: AmplifierStats) -> float:
+    def _poll_delay(self, amplifier_settings: AmplifierDeviceSettings, stats: AmplifierStats) -> float:
         """Delay before the next poll: the base interval, or an exponential backoff.
 
         The first failures in a streak retry at ``poll_interval``. The failure
         that reaches the connected threshold — the same one that clears
         ``_connected`` — and every further consecutive failure doubles the
         delay (2x, 4x, 8x, ...), capped at ``MAX_BACKOFF_FACTOR`` x
-        ``poll_interval``, so a board that keeps losing the bus stops consuming
+        ``poll_interval``, so a device that keeps losing the bus stops consuming
         poll slots. A successful read zeroes the streak, so the next delay is
         the base interval again.
         """
@@ -526,11 +567,11 @@ class CurrentAmplifierWorker(ValkeyWorker):
         # down for long enough, and anything past the cap is clamped anyway.
         return min(base * 2.0 ** min(excess, _MAX_BACKOFF_EXPONENT), base * MAX_BACKOFF_FACTOR)
 
-    async def _poll_amplifier(self, label: str) -> None:
-        """Poll one board forever: read, publish, repeat.
+    async def _poll_amplifier(self, device: str) -> None:
+        """Poll one device forever: read, publish, repeat.
 
         The loop never dies on a board error: a read failure increments the
-        board's error counters, logs at WARNING, and continues after a delay
+        device's error counters, logs at WARNING, and continues after a delay
         that backs off exponentially once the failure streak is established (see
         ``_poll_delay``). A successful reading updates the stats, resets the
         streak and publishes a stream entry.
@@ -545,8 +586,8 @@ class CurrentAmplifierWorker(ValkeyWorker):
         There is no connect stage: the EBIC driver opens its connection once per
         operation, so the loop reads directly.
         """
-        amplifier = self._amplifiers.get(label)
-        amplifier_settings = self._amplifier_settings.get(label)
+        amplifier = self._amplifiers.get(device)
+        amplifier_settings = self._amplifier_settings.get(device)
         if amplifier is None or amplifier_settings is None:
             return
         while True:
@@ -557,40 +598,41 @@ class CurrentAmplifierWorker(ValkeyWorker):
                 # read is not enough to report the board as gone — an RS485
                 # segment drops the occasional frame — so the flag clears only
                 # after the configured number of failures in a row.
-                stats = self._stats[label]
+                stats = self._stats[device]
                 stats.consecutive_failures += 1
                 if stats.consecutive_failures >= self._failure_threshold() and not isinstance(exc, GatewayBusy):
-                    self._connected[label] = False
-                self._record_error(label, exc, "read")
+                    self._connected[device] = False
+                self._record_error(device, exc, "read")
                 await self._sleep(self._poll_delay(amplifier_settings, stats))
                 continue
 
-            self._connected[label] = True
-            stats = self._stats[label]
+            self._connected[device] = True
+            stats = self._stats[device]
             stats.consecutive_failures = 0
             stats.reading_count += 1
             now = datetime.now(timezone.utc)
             stats.last_state = state
             stats.last_reading_at = now
             stats.last_error = None
-            await self._publish_reading(label, state, now)
+            await self._publish_reading(device, state, now)
 
             await self._sleep(amplifier_settings.poll_interval)
 
-    def _record_error(self, label: str, exc: Exception, stage: str) -> None:
-        """Increment a board's error counters and log a WARNING."""
-        stats = self._stats[label]
+    def _record_error(self, device: str, exc: Exception, stage: str) -> None:
+        """Increment a device's error counters and log a WARNING."""
+        stats = self._stats[device]
         stats.error_count += 1
         stats.last_error = str(exc)
-        self.logger.log(logging.WARNING, "Failed to %s amplifier %r: %s", stage, label, exc)
+        self.logger.log(logging.WARNING, "Failed to %s amplifier %r: %s", stage, device, exc)
 
-    async def _publish_reading(self, label: str, state: AmplifierState, now: datetime) -> None:
-        """Publish one reading to the board's stream.
+    async def _publish_reading(self, device: str, state: AmplifierState, now: datetime) -> None:
+        """Publish one reading to the device's stream.
 
-        The write is guarded on `self.client`; a glide error is logged at
-        WARNING and reported to the transport health, mirroring the telemetry
-        loop's error handling. ``filters`` is a tuple of structs, which ``xadd``
-        cannot take as a scalar, so it is published as one JSON string.
+        The stream key segment is the device id — the config map key — not the
+        display label. The write is guarded on `self.client`; a glide error is
+        logged at WARNING and reported to the transport health, mirroring the
+        telemetry loop's error handling. ``filters`` is a tuple of structs, which
+        ``xadd`` cannot take as a scalar, so it is published as one JSON string.
 
         ``preamp_range`` and ``feedback_resistor_ohm`` carry the same value (the
         selected Rf in ohm): the API charts neither, but both the older and the
@@ -599,7 +641,7 @@ class CurrentAmplifierWorker(ValkeyWorker):
         client = self.client
         if client is None:
             return
-        key = f"scietex:{self.service_name}:{self.instance_id}:current_amplifier:{label}:readings"
+        key = f"scietex:{self.service_name}:{self.instance_id}:current_amplifier:{device}:readings"
         try:
             await client.xadd(
                 key,
@@ -620,21 +662,21 @@ class CurrentAmplifierWorker(ValkeyWorker):
                     (b"output_overload", encode_flag(state.output_overload)),
                     (b"inverted", encode_flag(state.inverted)),
                     (b"filters", msgspec.json.encode(list(state.filters))),
-                    (b"transconductance_v_per_a", encode_value(self._transconductance(label, state))),
+                    (b"transconductance_v_per_a", encode_value(self._transconductance(device, state))),
                 ],
                 StreamAddOptions(trim=TrimByMaxLen(exact=False, threshold=self._stream_maxlen())),
             )
         except (GlideConnectionError, RequestError, GlideTimeoutError) as exc:
-            self.logger.log(logging.WARNING, "Failed to publish reading for amplifier %r: %s", label, exc)
+            self.logger.log(logging.WARNING, "Failed to publish reading for amplifier %r: %s", device, exc)
             self._health.report_failure(exc)
 
-    def _transconductance(self, label: str, state: AmplifierState) -> float | None:
+    def _transconductance(self, device: str, state: AmplifierState) -> float | None:
         """``Rf * gain`` for one reading, or ``None`` when either is unknown."""
         feedback = state.feedback_resistor_ohm
         gain = state.boost_gain
         if feedback is None or gain is None:
             return None
-        amplifier = self._amplifiers.get(label)
+        amplifier = self._amplifiers.get(device)
         if amplifier is None:
             return None
         try:

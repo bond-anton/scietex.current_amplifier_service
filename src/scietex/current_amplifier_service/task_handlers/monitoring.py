@@ -1,9 +1,9 @@
 """``monitoring:*`` control-plane tasks: start and stop amplifier poll loops.
 
-Each board is polled by one long-lived asyncio task started and cancelled by
+Each device is polled by one long-lived asyncio task started and cancelled by
 `CurrentAmplifierWorker.start_monitoring` and
 `CurrentAmplifierWorker.stop_monitoring`. The UI submits these tasks on the
-control lane to switch monitoring on or off for one board or for every board.
+control lane to switch monitoring on or off for one device or for every device.
 """
 
 from __future__ import annotations
@@ -33,11 +33,11 @@ class MonitoringRequest(msgspec.Struct, frozen=True, forbid_unknown_fields=True)
     """Request payload for a ``monitoring:*`` task.
 
     Args:
-        label: Board label to act on; ``None`` (or an empty payload) selects
-            every board.
+        device: Worker device id to act on; ``None`` (or an empty payload)
+            selects every device.
     """
 
-    label: str | None = None
+    device: str | None = None
 
 
 class MonitoringResponse(msgspec.Struct, frozen=True):
@@ -45,8 +45,8 @@ class MonitoringResponse(msgspec.Struct, frozen=True):
 
     Args:
         action: ``"start"`` or ``"stop"``.
-        labels: Labels actually affected by the call.
-        monitoring: Full per-label monitoring state after the call.
+        labels: Device ids actually affected by the call.
+        monitoring: Full per-device monitoring state after the call.
     """
 
     action: str
@@ -80,12 +80,12 @@ class MonitoringHandler(TaskHandler):
         return [MONITORING_START_TASK_NAME, MONITORING_STOP_TASK_NAME]
 
     async def handle(self, task_data: TaskData, *, capabilities: TaskCapabilities) -> TaskResult:
-        """Start or stop the poll loop for the selected board(s).
+        """Start or stop the poll loop for the selected device(s).
 
-        An empty payload selects every board. An unknown label yields
+        An empty payload selects every device. An unknown device id yields
         ``UNKNOWN_AMPLIFIER``; any other failure yields ``MONITORING_FAILED``.
-        Both are non-retryable: a bad label or a worker-level failure will not
-        succeed on retry.
+        Both are non-retryable: a bad device id or a worker-level failure will
+        not succeed on retry.
         """
         if task_data.payload:
             try:
@@ -98,9 +98,9 @@ class MonitoringHandler(TaskHandler):
         action = "start" if task_data.task == MONITORING_START_TASK_NAME else "stop"
         try:
             if action == "start":
-                labels = self._worker.start_monitoring(request.label)
+                labels = self._worker.start_monitoring(request.device)
             else:
-                labels = self._worker.stop_monitoring(request.label)
+                labels = self._worker.stop_monitoring(request.device)
         except KeyError as exc:
             return TaskResult(status="error", error=str(exc), error_code="UNKNOWN_AMPLIFIER", retryable=False)
         except Exception as exc:
