@@ -17,7 +17,7 @@ from scietex.current_amplifier_service.version import __version__
 ENV_SERVICE_NAME: str = "SCIETEX_SERVICE_NAME"
 ENV_LOGGING_LEVEL: str = "SCIETEX_LOGGING_LEVEL"
 
-DEFAULT_SERVICE_NAME: str = "CURRENT_AMPLIFIER"
+DEFAULT_SERVICE_NAME: str = "CurrentAmplifier"
 DEFAULT_LOGGING_LEVEL: str = "INFO"
 
 

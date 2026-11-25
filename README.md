@@ -230,7 +230,7 @@ start-current-amplifier-service --conf-dir ~/.config/scietex
 ```
 
 Flags: `--conf-dir` (auto-resolved when omitted), `--service-name` (default
-`$SCIETEX_SERVICE_NAME` or `CURRENT_AMPLIFIER`), `--logging-level` (default
+`$SCIETEX_SERVICE_NAME` or `CurrentAmplifier`), `--logging-level` (default
 `$SCIETEX_LOGGING_LEVEL` or `INFO`). It runs in the foreground until `SIGINT` or
 `SIGTERM`.
 

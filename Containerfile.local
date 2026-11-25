@@ -71,7 +71,7 @@ RUN useradd -m -u 1000 appuser && \
 # stop any straggling import from writing inside the image; the cache prefix
 # catches packages that ship without precompiled modules.
 ENV SCIETEX_CONFIG_DIR=/config \
-    SCIETEX_SERVICE_NAME=CURRENT_AMPLIFIER \
+    SCIETEX_SERVICE_NAME=CurrentAmplifier \
     SCIETEX_LOGGING_LEVEL=INFO \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONPYCACHEPREFIX=/tmp/pycache
