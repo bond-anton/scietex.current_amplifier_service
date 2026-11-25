@@ -1,0 +1,80 @@
+# Stage 1: Build Python dependencies
+# Set the base image using Python 3.14 and Debian Trixie (current stable)
+FROM python:3.14-slim-trixie  as builder
+
+# Version of the published scietex.current_amplifier_service wheel to install.
+# build_image.sh passes the version read from
+# src/scietex/current_amplifier_service/version.py, so the image and the PyPI
+# artifact always match.
+ARG VERSION
+
+WORKDIR /app
+
+# Install system dependencies (required for some Python packages)
+RUN apt-get update && apt-get install -y \
+    gcc \
+    python3-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create and activate virtual environment
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+# Install the released package from PyPI. The image is a distribution channel of
+# the same tagged source that was published, so it does not build from the local
+# checkout.
+# Then slim the venv: pip/setuptools/wheel are build-time only, and valkey-glide
+# ships one _fast_response extension per supported interpreter (cp39..cp314,
+# pypy) while only the running interpreter's is ever loaded.
+#
+# Bytecode is compiled here with unchecked-hash invalidation so the runtime
+# stage never writes a .pyc: a hash-based pyc is validated against the source
+# content, not its mtime, which is what makes the image safe on a read-only
+# rootfs (the runtime layer cannot be relied on to remember source mtimes).
+RUN pip install --no-cache-dir -U pip && \
+    pip install --no-cache-dir "scietex-current-amplifier-service==${VERSION}" && \
+    pip uninstall -y pip setuptools wheel && \
+    find /opt/venv -name '*.pyc' -delete && \
+    find /opt/venv -name '__pycache__' -type d -prune -exec rm -rf {} + && \
+    find /opt/venv/lib/python3.14/site-packages/glide_shared -name '*.so' \
+        ! -name '*cpython-314*' ! -name 'libglide_ffi.so' -delete && \
+    python -m compileall -q -f --invalidation-mode unchecked-hash \
+        /opt/venv/lib/python3.14/site-packages
+
+# Stage 2: Runtime image
+FROM python:3.14-slim-trixie
+
+WORKDIR /app
+
+# Copy virtual env from builder
+COPY --from=builder /opt/venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+# Run as non-root user. The service reaches the board over Modbus RTU through a
+# USB-RS485 adapter, so the container needs that device passed in and the
+# runtime user needs the adapter's group: `--device=/dev/ttyUSB0 --group-add
+# dialout`. Nothing else is privileged.
+RUN useradd -m -u 1000 appuser && \
+    chown -R appuser:appuser /app && \
+    chmod -R 755 /app
+
+# Configuration lives in a mounted volume so it survives container replacement.
+# SCIETEX_CONFIG_DIR is honored by the framework's prepare_conf_dir; the service
+# namespaces its files under <config-dir>/current_amplifier/.
+#
+# The rootfs is meant to be run read-only: the only writable location is that
+# volume. Bytecode is precompiled in the builder stage, and these two variables
+# stop any straggling import from writing inside the image; the cache prefix
+# catches packages that ship without precompiled modules.
+ENV SCIETEX_CONFIG_DIR=/config \
+    SCIETEX_SERVICE_NAME=CURRENT_AMPLIFIER \
+    SCIETEX_LOGGING_LEVEL=INFO \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPYCACHEPREFIX=/tmp/pycache
+RUN mkdir -p /config && chown appuser:appuser /config
+VOLUME ["/config"]
+
+USER appuser
+
+# Run the app
+CMD ["start-current-amplifier-service"]
