@@ -18,6 +18,7 @@ from _helpers import (
     make_settings,
     make_tcp_transport,
 )
+from scietex.hal.current_amplifier.base import BiasCompensationSource
 from scietex.hal.current_amplifier.base.capabilities import (
     Access,
     BandwidthCapabilities,
@@ -48,6 +49,7 @@ from scietex.current_amplifier_service.task_handlers import (
     AMPLIFIER_READ_TASK_NAME,
     AMPLIFIER_SELECT_PREAMP_RANGE_TASK_NAME,
     AMPLIFIER_SET_BANDWIDTH_TASK_NAME,
+    AMPLIFIER_SET_BIAS_COMPENSATION_SOURCE_TASK_NAME,
     AMPLIFIER_SET_BOOST_GAIN_TASK_NAME,
     AMPLIFIER_SET_DC_BIAS_LEVEL_TASK_NAME,
     AMPLIFIER_SET_DC_BIAS_TASK_NAME,
@@ -65,6 +67,7 @@ from scietex.current_amplifier_service.task_handlers import (
     AmplifierListResponse,
     AmplifierStatusResponse,
 )
+from scietex.current_amplifier_service.task_handlers.amplifier_control import _COMMAND_BY_TASK
 
 if TYPE_CHECKING:
     from scietex.current_amplifier_service.amplifier_worker import CurrentAmplifierWorker
@@ -86,6 +89,7 @@ _WRITE_TASK_NAMES = [
     AMPLIFIER_SET_FILTER_TASK_NAME,
     AMPLIFIER_SET_INPUT_COMPENSATION_TASK_NAME,
     AMPLIFIER_SET_INPUT_COMPENSATION_LEVEL_TASK_NAME,
+    AMPLIFIER_SET_BIAS_COMPENSATION_SOURCE_TASK_NAME,
     AMPLIFIER_SET_INVERTED_TASK_NAME,
 ]
 
@@ -113,6 +117,7 @@ PLUGIN_TASKS: frozenset[str] = frozenset(
         "current_amplifier:set-input-compensation",
         "current_amplifier:set-input-compensation-level",
         "current_amplifier:set-inverted",
+        "current_amplifier:set-bias-compensation-source",
     }
 )
 
@@ -132,6 +137,7 @@ PLUGIN_COMMAND_FIELDS: tuple[str, ...] = (
     "input_compensation_enabled",
     "input_compensation_level",
     "inverted",
+    "bias_compensation_source",
 )
 
 #: The old worker spellings that must no longer decode.
@@ -163,6 +169,9 @@ def _full_capabilities() -> CurrentAmplifierCapabilities:
             types=(FilterType.LOW_PASS, FilterType.HIGH_PASS, FilterType.BAND_PASS), enabled=_READ_WRITE, cutoff=_READ_WRITE
         ),
         input_compensation=CompensationCapabilities(enabled=_READ_WRITE, level=_READ_WRITE),
+        bias_compensation_source=SelectableCapabilities(
+            access=_READ_WRITE, options=(BiasCompensationSource.MANUAL, BiasCompensationSource.DAC)
+        ),
         invert_output=_READ_WRITE,
     )
 
@@ -207,6 +216,13 @@ def _read_only(gate: str) -> CurrentAmplifierCapabilities:
         return replace(tree, input_compensation=CompensationCapabilities(enabled=_READ_ONLY, level=_READ_WRITE))
     if gate == "capabilities.input_compensation.level.write":
         return replace(tree, input_compensation=CompensationCapabilities(enabled=_READ_WRITE, level=_READ_ONLY))
+    if gate == "capabilities.bias_compensation_source.access.write":
+        return replace(
+            tree,
+            bias_compensation_source=SelectableCapabilities(
+                access=_READ_ONLY, options=(BiasCompensationSource.MANUAL, BiasCompensationSource.DAC)
+            ),
+        )
     if gate == "can_set_invert_output":
         return replace(tree, invert_output=_READ_ONLY)
     raise AssertionError(f"unmapped capability gate {gate!r}")
@@ -276,6 +292,7 @@ class _RecordingAmplifier(CurrentAmplifierProtocol):
         self.set_filter_calls: list[FilterSetting] = []
         self.set_input_compensation_calls: list[bool] = []
         self.set_input_compensation_level_calls: list[float] = []
+        self.set_bias_compensation_source_calls: list[BiasCompensationSource] = []
         self.set_inverted_calls: list[bool] = []
 
     def _forbid_io(self, operation: str) -> None:
@@ -345,6 +362,12 @@ class _RecordingAmplifier(CurrentAmplifierProtocol):
         self.set_input_compensation_level_calls.append(level)
         self._raise_control()
 
+    async def set_bias_compensation_source(self, source: BiasCompensationSource) -> None:
+        self._forbid_io("set_bias_compensation_source")
+        self.set_bias_compensation_source_calls.append(source)
+        self._raise_control()
+        self.state = msgspec.structs.replace(self.state, bias_compensation_source=source)
+
     async def set_inverted(self, inverted: bool) -> None:
         self._forbid_io("set_inverted")
         self.set_inverted_calls.append(inverted)
@@ -362,6 +385,7 @@ def _all_control_calls(amplifier: _RecordingAmplifier) -> list[list[Any]]:
         amplifier.set_filter_calls,
         amplifier.set_input_compensation_calls,
         amplifier.set_input_compensation_level_calls,
+        amplifier.set_bias_compensation_source_calls,
         amplifier.set_inverted_calls,
     ]
 
@@ -444,6 +468,18 @@ def test_supported_tasks_are_exactly_the_plugin_catalogue_plus_registry_verbs() 
     assert set(_ALL_TASK_NAMES) == expected
     assert len(handler.supported_tasks) == len(expected)
     assert all(name.startswith("current_amplifier:") for name in handler.supported_tasks)
+
+
+def test_bias_compensation_source_task_is_registered_with_read_back() -> None:
+    """The new verb has a dispatch row gated on write access and re-reads the relay state."""
+    handler = _handler(_StubWorker())
+
+    assert AMPLIFIER_SET_BIAS_COMPENSATION_SOURCE_TASK_NAME in handler.supported_tasks
+    command = _COMMAND_BY_TASK[AMPLIFIER_SET_BIAS_COMPENSATION_SOURCE_TASK_NAME]
+    assert command.gates == ("capabilities.bias_compensation_source.access.write",)
+    assert command.required == ("bias_compensation_source",)
+    assert command.echo == ("bias_compensation_source",)
+    assert command.read_back is True
 
 
 def test_unknown_and_legacy_task_names_are_not_handled() -> None:
@@ -805,6 +841,14 @@ _WRITE_CASES = [
         False,
     ),
     (
+        AMPLIFIER_SET_BIAS_COMPENSATION_SOURCE_TASK_NAME,
+        {"device": DEVICE, "bias_compensation_source": "dac"},
+        "set_bias_compensation_source_calls",
+        BiasCompensationSource.DAC,
+        {"bias_compensation_source": "dac"},
+        True,
+    ),
+    (
         AMPLIFIER_SET_INVERTED_TASK_NAME,
         {"device": DEVICE, "inverted": True},
         "set_inverted_calls",
@@ -838,6 +882,72 @@ async def test_write_forwards_the_exact_argument(task, payload, recorder, expect
         assert isinstance(response.state["filters"], list)
     else:
         assert response.state is None
+
+
+@pytest.mark.asyncio
+async def test_set_bias_compensation_source_forwards_dac_and_reads_the_relay_back() -> None:
+    """``dac`` reaches the driver as the enum member and the read-back confirms it."""
+    amplifier = _RecordingAmplifier()
+    worker = _worker_for(amplifier)
+
+    result = await _handler(worker).handle(
+        _make_task(
+            AMPLIFIER_SET_BIAS_COMPENSATION_SOURCE_TASK_NAME,
+            {"device": DEVICE, "bias_compensation_source": "dac"},
+        ),
+        capabilities=_make_capabilities(),
+    )
+
+    assert result.status == "success"
+    response = msgspec.json.decode(result.payload, type=AmplifierCommandResponse)
+    assert response.applied == {"bias_compensation_source": "dac"}
+    assert response.readback_error is None
+    assert amplifier.set_bias_compensation_source_calls == [BiasCompensationSource.DAC]
+    assert amplifier.read_calls == 1
+    assert response.state is not None
+    assert response.state["bias_compensation_source"] == "dac"
+
+
+@pytest.mark.asyncio
+async def test_set_bias_compensation_source_maps_manual_to_the_enum() -> None:
+    """``manual`` reaches the driver as `BiasCompensationSource.MANUAL`."""
+    amplifier = _RecordingAmplifier()
+    worker = _worker_for(amplifier)
+
+    result = await _handler(worker).handle(
+        _make_task(
+            AMPLIFIER_SET_BIAS_COMPENSATION_SOURCE_TASK_NAME,
+            {"device": DEVICE, "bias_compensation_source": "manual"},
+        ),
+        capabilities=_make_capabilities(),
+    )
+
+    assert result.status == "success"
+    response = msgspec.json.decode(result.payload, type=AmplifierCommandResponse)
+    assert response.applied == {"bias_compensation_source": "manual"}
+    assert amplifier.set_bias_compensation_source_calls == [BiasCompensationSource.MANUAL]
+
+
+@pytest.mark.asyncio
+async def test_unknown_bias_compensation_source_is_invalid_payload() -> None:
+    """A spelling outside the HAL enum is rejected during decode, before the driver."""
+    amplifier = _RecordingAmplifier(strict=True)
+    worker = _worker_for(amplifier)
+
+    result = await _handler(worker).handle(
+        _make_task(
+            AMPLIFIER_SET_BIAS_COMPENSATION_SOURCE_TASK_NAME,
+            {"device": DEVICE, "bias_compensation_source": "external"},
+        ),
+        capabilities=_make_capabilities(),
+    )
+
+    assert result.status == "error"
+    assert result.error_code == "INVALID_PAYLOAD"
+    assert result.retryable is False
+    assert "bias_compensation_source" in result.error
+    assert all(calls == [] for calls in _all_control_calls(amplifier))
+    assert amplifier.read_calls == 0
 
 
 #: One verbatim plugin payload per write task, spelled exactly as the plugin
@@ -878,6 +988,12 @@ _PLUGIN_WRITE_COMMANDS = [
         {"device": DEVICE, "input_compensation_level": 0.25},
         "set_input_compensation_level_calls",
         0.25,
+    ),
+    (
+        AMPLIFIER_SET_BIAS_COMPENSATION_SOURCE_TASK_NAME,
+        {"device": DEVICE, "bias_compensation_source": "dac"},
+        "set_bias_compensation_source_calls",
+        BiasCompensationSource.DAC,
     ),
     (AMPLIFIER_SET_INVERTED_TASK_NAME, {"device": DEVICE, "inverted": True}, "set_inverted_calls", True),
 ]
@@ -1221,6 +1337,12 @@ _GATE_CASES = [
         "capabilities.input_compensation.level.write",
         "set_input_compensation_level_calls",
     ),
+    (
+        AMPLIFIER_SET_BIAS_COMPENSATION_SOURCE_TASK_NAME,
+        {"device": DEVICE, "bias_compensation_source": "manual"},
+        "capabilities.bias_compensation_source.access.write",
+        "set_bias_compensation_source_calls",
+    ),
     (AMPLIFIER_SET_INVERTED_TASK_NAME, {"device": DEVICE, "inverted": True}, "can_set_invert_output", "set_inverted_calls"),
 ]
 
@@ -1452,6 +1574,7 @@ _MISSING_FIELD_CASES = [
     (AMPLIFIER_SET_FILTER_TASK_NAME, "filter_type"),
     (AMPLIFIER_SET_INPUT_COMPENSATION_TASK_NAME, "input_compensation_enabled"),
     (AMPLIFIER_SET_INPUT_COMPENSATION_LEVEL_TASK_NAME, "input_compensation_level"),
+    (AMPLIFIER_SET_BIAS_COMPENSATION_SOURCE_TASK_NAME, "bias_compensation_source"),
     (AMPLIFIER_SET_INVERTED_TASK_NAME, "inverted"),
 ]
 

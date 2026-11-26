@@ -206,6 +206,7 @@ Data lane:
 | `current_amplifier:set-filter` | data | `capabilities.filters.enabled.write` and `filter_type` in `capabilities.filters.types`; `capabilities.filters.cutoff.write` when `filter_low_cutoff_hz` or `filter_high_cutoff_hz` is given | `{"device": ..., "filter_type": "low_pass", "filter_enabled": true, "filter_low_cutoff_hz": 10, "filter_high_cutoff_hz": null}` | echo `filter_type`, `filter_enabled`, `filter_low_cutoff_hz`, `filter_high_cutoff_hz` |
 | `current_amplifier:set-input-compensation` | data | `capabilities.input_compensation.enabled.write` | `{"device": ..., "input_compensation_enabled": true}` | echo `input_compensation_enabled` |
 | `current_amplifier:set-input-compensation-level` | data | `capabilities.input_compensation.level.write` | `{"device": ..., "input_compensation_level": 1.0}` | echo `input_compensation_level` |
+| `current_amplifier:set-bias-compensation-source` | data | `capabilities.bias_compensation_source.access.write` | `{"device": ..., "bias_compensation_source": "dac"}` (`"dac"` or `"manual"`) | echo `bias_compensation_source` plus the state read back after the switch |
 | `current_amplifier:set-inverted` | data | `can_set_invert_output` | `{"device": ..., "inverted": true}` | echo `inverted` |
 
 Every write task is gated on the board's declared capabilities, so an

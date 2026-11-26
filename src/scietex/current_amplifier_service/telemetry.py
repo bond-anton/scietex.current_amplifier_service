@@ -36,6 +36,7 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
 import msgspec
+from scietex.hal.current_amplifier.base import BiasCompensationSource
 from scietex.hal.current_amplifier.base.data import FilterSetting
 
 if TYPE_CHECKING:
@@ -84,6 +85,8 @@ class AmplifierTelemetry(msgspec.Struct, frozen=True):
         output_overload: Output-overload flag, or ``None``.
         input_compensation_enabled: Whether compensation is on, or ``None``.
         input_compensation_level: Compensation level in device-native units.
+        bias_compensation_source: Source feeding DC bias and input compensation
+            together, or ``None``.
         inverted: Whether the output polarity is inverted, or ``None``.
         last_error: Message of the last failed read, or ``None``.
         last_ok: UTC ISO-8601 timestamp of the last successful read, or ``None``.
@@ -113,6 +116,7 @@ class AmplifierTelemetry(msgspec.Struct, frozen=True):
     output_overload: bool | None = None
     input_compensation_enabled: bool | None = None
     input_compensation_level: float | None = None
+    bias_compensation_source: BiasCompensationSource | None = None
     inverted: bool | None = None
     last_error: str | None = None
     last_ok: str | None = None
@@ -233,6 +237,7 @@ def _amplifier_telemetry(
         output_overload=state.output_overload if state is not None else None,
         input_compensation_enabled=state.input_compensation_enabled if state is not None else None,
         input_compensation_level=state.input_compensation_level if state is not None else None,
+        bias_compensation_source=state.bias_compensation_source if state is not None else None,
         inverted=state.inverted if state is not None else None,
         last_error=stats.last_error,
         last_ok=last_ok,

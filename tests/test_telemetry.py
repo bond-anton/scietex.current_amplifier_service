@@ -13,6 +13,7 @@ from _helpers import (
     make_tcp_transport,
     register_fake_driver,
 )
+from scietex.hal.current_amplifier.base import BiasCompensationSource
 from scietex.hal.current_amplifier.base.capabilities import FilterType
 from scietex.hal.current_amplifier.base.data import AmplifierState, FilterSetting
 from scietex.service import ValkeyWorkerConfig
@@ -66,6 +67,7 @@ def _sample_state(**overrides: object) -> AmplifierState:
         "output_overload": False,
         "input_compensation_enabled": False,
         "input_compensation_level": 0.5,
+        "bias_compensation_source": BiasCompensationSource.DAC,
         "inverted": False,
     }
     values.update(overrides)
@@ -133,6 +135,7 @@ async def test_devices_keyed_by_device_id_with_state_precedence(tmp_path) -> Non
     assert error_device.last_ok is None
     assert error_device.preamp_range is None
     assert error_device.feedback_resistor_ohm is None
+    assert error_device.bias_compensation_source is None
 
     monitoring_device = telemetry.devices["b"]
     assert monitoring_device.state == "monitoring"
@@ -142,6 +145,7 @@ async def test_devices_keyed_by_device_id_with_state_precedence(tmp_path) -> Non
     assert monitoring_device.monitoring is True
     assert monitoring_device.reading_count == 7
     assert monitoring_device.preamp_range == monitoring_device.feedback_resistor_ohm == 1_000_000.0
+    assert monitoring_device.bias_compensation_source is BiasCompensationSource.DAC
     assert monitoring_device.ts == reading_at.isoformat()
     assert monitoring_device.last_ok == reading_at.isoformat()
     assert datetime.fromisoformat(monitoring_device.ts) == reading_at
@@ -266,6 +270,7 @@ async def test_msgpack_roundtrip_preserves_the_wire_contract(tmp_path) -> None:
     assert raw["poll_enabled"] is True
     assert raw["schema_version"] == 1
     assert set(raw["devices"]) == {"a"}
+    assert raw["devices"]["a"]["bias_compensation_source"] == "dac"
 
     decoded = msgspec.msgpack.decode(payload, type=CurrentAmplifierServiceTelemetry)
     assert decoded.state == telemetry.state
@@ -274,6 +279,20 @@ async def test_msgpack_roundtrip_preserves_the_wire_contract(tmp_path) -> None:
     assert decoded.instance_id == worker.instance_id
     assert decoded.poll_enabled is True
     assert decoded.timestamp == telemetry.timestamp
+
+    await worker.close_amplifiers()
+
+
+@pytest.mark.asyncio
+async def test_bias_compensation_source_follows_the_state(tmp_path) -> None:
+    """The selector is reported from the state and stays ``None`` without one."""
+    worker = await _worker_with_devices(tmp_path, ["a", "b"])
+    worker.stats["a"].last_state = _sample_state(bias_compensation_source=BiasCompensationSource.MANUAL)
+
+    devices = build_telemetry(worker).devices
+
+    assert devices["a"].bias_compensation_source is BiasCompensationSource.MANUAL
+    assert devices["b"].bias_compensation_source is None
 
     await worker.close_amplifiers()
 

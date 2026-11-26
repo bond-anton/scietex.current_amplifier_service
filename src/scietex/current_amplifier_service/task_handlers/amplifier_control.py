@@ -30,6 +30,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, cast
 
 import msgspec
+from scietex.hal.current_amplifier.base import BiasCompensationSource
 from scietex.hal.current_amplifier.base.capabilities import FilterType
 from scietex.hal.current_amplifier.base.data import FilterSetting
 from scietex.hal.current_amplifier.scietex.ebic.modbus.v1 import GatewayBusy
@@ -85,6 +86,9 @@ AMPLIFIER_SET_INPUT_COMPENSATION_TASK_NAME = "current_amplifier:set-input-compen
 
 #: Task name that writes the input-compensation level.
 AMPLIFIER_SET_INPUT_COMPENSATION_LEVEL_TASK_NAME = "current_amplifier:set-input-compensation-level"
+
+#: Task name that selects the source feeding DC bias and input compensation.
+AMPLIFIER_SET_BIAS_COMPENSATION_SOURCE_TASK_NAME = "current_amplifier:set-bias-compensation-source"
 
 #: Task name that switches output-polarity inversion on or off.
 AMPLIFIER_SET_INVERTED_TASK_NAME = "current_amplifier:set-inverted"
@@ -158,6 +162,8 @@ class AmplifierCommandRequest(msgspec.Struct, frozen=True, forbid_unknown_fields
             ``current_amplifier:set-input-compensation``.
         input_compensation_level: Device-native level for
             ``current_amplifier:set-input-compensation-level``.
+        bias_compensation_source: Source feeding DC bias and input compensation
+            together for ``current_amplifier:set-bias-compensation-source``.
         inverted: Output-polarity state for ``current_amplifier:set-inverted``.
     """
 
@@ -174,6 +180,7 @@ class AmplifierCommandRequest(msgspec.Struct, frozen=True, forbid_unknown_fields
     filter_high_cutoff_hz: float | None = None
     input_compensation_enabled: bool | None = None
     input_compensation_level: float | None = None
+    bias_compensation_source: BiasCompensationSource | None = None
     inverted: bool | None = None
 
 
@@ -665,6 +672,11 @@ async def _apply_input_compensation_level(amplifier: CurrentAmplifierProtocol, r
     await amplifier.set_input_compensation_level(cast(float, request.input_compensation_level))
 
 
+async def _apply_bias_compensation_source(amplifier: CurrentAmplifierProtocol, request: AmplifierCommandRequest) -> None:
+    """Select the source feeding DC bias and input compensation together."""
+    await amplifier.set_bias_compensation_source(cast(BiasCompensationSource, request.bias_compensation_source))
+
+
 async def _apply_inverted(amplifier: CurrentAmplifierProtocol, request: AmplifierCommandRequest) -> None:
     """Switch output-polarity inversion."""
     await amplifier.set_inverted(cast(bool, request.inverted))
@@ -759,6 +771,13 @@ _COMMAND_BY_TASK: dict[str, _Command] = {
         apply=_apply_input_compensation_level,
         echo=("input_compensation_level",),
         required=("input_compensation_level",),
+    ),
+    AMPLIFIER_SET_BIAS_COMPENSATION_SOURCE_TASK_NAME: _Command(
+        gates=("capabilities.bias_compensation_source.access.write",),
+        apply=_apply_bias_compensation_source,
+        echo=("bias_compensation_source",),
+        required=("bias_compensation_source",),
+        read_back=True,
     ),
     AMPLIFIER_SET_INVERTED_TASK_NAME: _Command(
         gates=("can_set_invert_output",),
